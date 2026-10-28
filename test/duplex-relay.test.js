@@ -3,11 +3,11 @@
 // progress, the switch changing drops waiting notices, work from a replaced connection is dropped, and the outbox
 // evicts by identity.
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { claim, finish, textPrint } from "../src/requests.js";
+import { claim, finish, textPrint, answersPrint } from "../src/requests.js";
 import { Relay } from "../src/relay.js";
 import { card } from "./standin.js";
 
@@ -285,4 +285,55 @@ test("R15 (captain's boundary): a comment timestamped exactly when the connectio
   const said = r.sent.join("\n");
   assert.doesNotMatch(said, /at the instant/);
   assert.match(said, /a moment later/);
+});
+
+test("R15 (captain's boundary), pushed later: with nothing in the baseline, a pushed line stamped exactly at the connection start is skipped, one a millisecond later is news", async () => {
+  const r = rig();
+  await r.relay.onUp(r.reads);
+  const edge = r.relay.s.connectedAt;
+  await r.relay.onCards([live()]); // the baseline read finds an empty thread
+  await r.relay.onThread({ cardId: "1", messages: [{ id: 1, who: "captain", text: "at the instant", at: edge }] });
+  await r.relay.onThread({ cardId: "1", messages: [{ id: 1, who: "captain", text: "at the instant", at: edge }, { id: 2, who: "captain", text: "a moment later", at: edge + 1 }] });
+  await r.relay.idle();
+  const said = r.sent.join("\n");
+  assert.doesNotMatch(said, /at the instant/);
+  assert.match(said, /a moment later/);
+});
+
+test("R17: a relayed card's current offer and lifecycle are kept as snapshots arrive, so an accepted answer to the newest offer is not echoed when the card ends before the next list", async () => {
+  const r = rig();
+  await r.relay.onUp(r.reads);
+  await r.relay.onCards([live()]);
+  r.relay.onDown();
+  await r.relay.onUp(r.reads);
+  const newer = live(card("1", { offerId: "1-v2", lifecycleId: "1-l2" }));
+  r.mode = "refuse"; // the new version cannot be delivered: only the descriptor follows it
+  await r.relay.onCards([newer]);
+  r.mode = "ok";
+  r.relay.onDown();
+  await r.relay.onUp(r.reads);
+  const edge = r.relay.s.connectedAt;
+  const done = claim(r.dir, "req-aaaaaaaa", "p3", { subject: { kind: "answer", cardId: "1", lifecycleId: "1-l2", offerId: "1-v2", actionId: "go", answersFp: answersPrint([]) }, holdMs: 60000 });
+  finish(done.path, { ok: true }, { outcome: "accepted" });
+  r.reads.past = async (id) => ({ id, title: "Card 1", ending: { how: "chose", actionId: "go", label: "Go", by: "captain", at: edge + 1000 }, answers: [] });
+  const before = r.sent.length;
+  await r.relay.onCards([]);
+  await r.relay.idle();
+  assert.equal(r.sent.length, before, "Grok bot's own accepted answer to the newest offer is not echoed");
+});
+
+test("R16: a receipt file from before descriptors is upgraded by an unchanged card seen on a later list, so its later ending is still reported", async () => {
+  const r = rig();
+  writeFileSync(join(r.dir, "relay.json"), JSON.stringify({ sent: { 1: "1-v1" }, noticeSent: false, ended: [] }));
+  const relay = new Relay({ dir: r.dir, send: r.send, enabled: () => true, epoch: () => 0, pollMs: 5, reads: r.reads });
+  await relay.onUp(r.reads);
+  await relay.onCards([live()]); // unchanged: nothing is sent, but its descriptor is learned
+  assert.equal(r.sent.length, 0);
+  relay.onDown();
+  await relay.onUp(r.reads);
+  const edge = relay.s.connectedAt;
+  r.reads.past = async (id) => ({ id, title: "Card 1", ending: { how: "chose", actionId: "go", label: "Go", by: "captain", at: edge + 1000 }, answers: [] });
+  await relay.onCards([]);
+  await relay.idle();
+  assert.match(r.sent.join("\n"), /Card 1/);
 });

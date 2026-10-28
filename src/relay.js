@@ -190,7 +190,7 @@ export class Relay {
     }
     // Cards told of before this connection and not in its first list may have ended since it began: known again, but only
     // an ending after the connection began is reported (the earlier ones are not caught up).
-    if (first) for (const id of Object.keys(this.sent)) if (!s.known.has(id) && this.meta[id]) s.known.set(id, { ...this.meta[id], restored: true });
+    if (first) for (const id of Object.keys(this.sent)) if (!live.has(id) && !s.known.has(id) && this.meta[id]) s.known.set(id, { ...this.meta[id], restored: true });
     // Card state changes in the same order as thread and event handling, so a queued update still finds its card.
     this.#serial(async () => {
       if (!this.#alive(s)) return;
@@ -207,7 +207,10 @@ export class Relay {
         s.early.delete(id);
       }
       if (!this.#alive(s)) return;
-      for (const c of cards) s.known.set(c.id, c);
+      for (const c of cards) {
+        s.known.set(c.id, c);
+        if (c.id in this.sent) this.#remember(c); // the current offer and lifecycle, in arrival order; also upgrades a receipt file from before descriptors
+      }
       for (const id of Object.keys(this.sent)) if (!live.has(id)) (delete this.sent[id], delete this.meta[id]);
       this.#save();
       for (const c of cards) {
@@ -407,7 +410,9 @@ export class Relay {
     const last = s.lastLine.get(card.id);
     s.lastLine.set(card.id, Math.max(newest, last ?? 0));
     if (last === undefined) return;
-    for (const m of messages.filter((x) => Number(x.id) > last && x.text && ["captain", "crewmate", "firstmate"].includes(x.who))) {
+    const since = s.introduced.get(card.id) ?? 0;
+    // A line stamped at or before the moment the card was first seen is history, however late it is pushed (equal: skipped).
+    for (const m of messages.filter((x) => Number(x.id) > last && x.text && (x.at === undefined || x.at > since) && ["captain", "crewmate", "firstmate"].includes(x.who))) {
       await this.#line(s, card, m);
     }
   }
