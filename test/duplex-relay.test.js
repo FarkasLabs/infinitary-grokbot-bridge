@@ -681,6 +681,7 @@ for (const [how, observe] of [
     r.gate = null;
     await notice;
     await seen;
+    assert.equal(r.relay.outbox.length, 0, "dropped as soon as its chunk is refused");
     await r.relay.tick();
     await r.relay.onUp(r.reads);
     await r.relay.onEvent({ type: "user_turn", text: "said after the switch" });
