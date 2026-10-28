@@ -337,3 +337,31 @@ test("R16: a receipt file from before descriptors is upgraded by an unchanged ca
   await relay.idle();
   assert.match(r.sent.join("\n"), /Card 1/);
 });
+
+test("R17: an older offer's delivery finishing after a newer list does not downgrade the card's descriptor, even when the newer offer is rejected", async () => {
+  const r = rig();
+  await r.relay.onUp(r.reads);
+  r.mode = (m) => (/offer 1-v2/.test(m) ? { ok: false, status: 403, rejected: true } : (r.sent.push(m), { ok: true, status: 200 }));
+  r.gate = deferred(); // the first offer's delivery is still in flight when the newer list arrives
+  const first = r.relay.onCards([live()]);
+  const second = r.relay.onCards([live(card("1", { offerId: "1-v2", lifecycleId: "1-l2" }))]);
+  await wait(20);
+  r.gate.resolve();
+  r.gate = null;
+  await first;
+  await second;
+  await r.relay.idle();
+  assert.equal(r.relay.meta["1"].offerId, "1-v2");
+  assert.equal(r.relay.meta["1"].lifecycleId, "1-l2");
+  r.mode = "ok";
+  r.relay.onDown();
+  await r.relay.onUp(r.reads);
+  const edge = r.relay.s.connectedAt;
+  const done = claim(r.dir, "req-bbbbbbbb", "p4", { subject: { kind: "answer", cardId: "1", lifecycleId: "1-l2", offerId: "1-v2", actionId: "go", answersFp: answersPrint([]) }, holdMs: 60000 });
+  finish(done.path, { ok: true }, { outcome: "accepted" });
+  r.reads.past = async (id) => ({ id, title: "Card 1", ending: { how: "chose", actionId: "go", label: "Go", by: "captain", at: edge + 1000 }, answers: [] });
+  const before = r.sent.length;
+  await r.relay.onCards([]);
+  await r.relay.idle();
+  assert.equal(r.sent.length, before, "an accepted answer to the newest offer is not echoed");
+});

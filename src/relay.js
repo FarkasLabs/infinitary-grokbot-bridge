@@ -31,6 +31,7 @@ export class Relay {
     const saved = readJson(receiptsPath(dir), {});
     this.sent = saved.sent ?? {};
     this.meta = saved.meta ?? {};
+    this.latest = new Map(); // each card as the newest list showed it, in arrival order
     this.noticeSent = saved.noticeSent ?? false;
     this.ended = saved.ended ?? [];
     this.reads = reads;
@@ -209,9 +210,10 @@ export class Relay {
       if (!this.#alive(s)) return;
       for (const c of cards) {
         s.known.set(c.id, c);
+        this.latest.set(c.id, c);
         if (c.id in this.sent) this.#remember(c); // the current offer and lifecycle, in arrival order; also upgrades a receipt file from before descriptors
       }
-      for (const id of Object.keys(this.sent)) if (!live.has(id)) (delete this.sent[id], delete this.meta[id]);
+      for (const id of Object.keys(this.sent)) if (!live.has(id)) (delete this.sent[id], delete this.meta[id], this.latest.delete(id));
       this.#save();
       for (const c of cards) {
         const early = s.early.get(c.id);
@@ -226,7 +228,7 @@ export class Relay {
     if (!this.enabled()) return;
     const ready = cards.filter((c) => c.status !== "streaming");
     const live = new Set(cards.map((c) => c.id));
-    if (!s.up) for (const id of Object.keys(this.sent)) if (!live.has(id)) (delete this.sent[id], delete this.meta[id]);
+    if (!s.up) for (const id of Object.keys(this.sent)) if (!live.has(id)) (delete this.sent[id], delete this.meta[id], this.latest.delete(id));
     const due = ready
       .filter((c) => this.sent[c.id] !== versionOf(c))
       .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
@@ -234,12 +236,12 @@ export class Relay {
     const rest = due.slice(0, due.length - shown.length);
     for (const card of shown) {
       const updated = card.id in this.sent;
-      if (await this.#emit(cardMessage(card, { updated }))) (this.sent[card.id] = versionOf(card), this.#remember(card));
+      if (await this.#emit(cardMessage(card, { updated }))) (this.sent[card.id] = versionOf(card), this.#remember(this.latest.get(card.id) ?? card));
     }
     if (rest.length) {
       const lines = rest.map((c) => `- ${c.title} (card ${c.id})`);
       const ok = await this.#emit(`${rest.length} more card${rest.length === 1 ? "" : "s"} not sent in full:\n${lines.join("\n")}\nAsk for any of them by id.`);
-      if (ok) for (const c of rest) (this.sent[c.id] = versionOf(c), this.#remember(c));
+      if (ok) for (const c of rest) (this.sent[c.id] = versionOf(c), this.#remember(this.latest.get(c.id) ?? c));
     }
     this.#save();
   }
