@@ -323,7 +323,7 @@ export class Relay {
     const past = await s.reads.past?.(card.id).catch((e) => (this.log(`past read: ${e.message}`), null));
     const e = past?.ending;
     if (!this.#alive(s) || !e || !["chose", "dismissed"].includes(e.how) || (e.by && e.by !== "captain")) return;
-    if (card.restored && !((e.at ?? 0) >= s.connectedAt)) return; // it ended before this connection: not caught up
+    if (card.restored && !((e.at ?? 0) > s.connectedAt)) return; // it ended before this connection began, or at that instant: not caught up
     const ours = (r) => r.subject.cardId === card.id && r.subject.lifecycleId === card.lifecycleId && r.subject.offerId === card.offerId;
     const open = (r) => r.state === "started" && r.outcome === undefined && r.until > Date.now();
     let silent = false;
