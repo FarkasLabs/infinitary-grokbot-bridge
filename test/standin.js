@@ -101,7 +101,9 @@ export async function startHome({ cards = [] } = {}) {
             const [cardId, actionId] = f.args;
             const c = state.cards.find((x) => x.id === cardId);
             // Like Infinitary: a press on a card no longer shown answers {} (crewSupervisor.ts), and every action closes its card.
-            const refusal = state.refuseAct ?? (c && !c.actions?.some((a) => a.id === actionId) ? "undeclared" : undefined);
+            // A card off the captain's stage (awaiting, no sentBackAt) is refused with this wording, and nothing is recorded.
+            const offStage = c && c.awaiting !== undefined && c.sentBackAt === undefined;
+            const refusal = state.refuseAct ?? (offStage ? "This choice is not ready. Wait for the card to return." : c && !c.actions?.some((a) => a.id === actionId) ? "undeclared" : undefined);
             if (state.beatBy && c) {
               // The captain pressed another button a moment earlier: the card is already gone and the press is ignored silently.
               state.endCard(cardId, { how: "chose", actionId: state.beatBy, by: "captain" });

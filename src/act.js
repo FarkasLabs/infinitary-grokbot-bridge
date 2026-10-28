@@ -1,5 +1,6 @@
 import { checkAnswers } from "./questions.js";
 import { answersPrint, claim, finish, fingerprint, mark, textPrint } from "./requests.js";
+import { onStage } from "./text.js";
 
 const CARD_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
 const IDENT = /^[A-Za-z0-9_.:-]{1,64}$/;
@@ -61,6 +62,7 @@ export async function answerCard(link, dir, opts) {
   if (!prior.fresh) return { ...prior.result, replayed: true };
 
   const card = currentCard(await link.invoke("inf:cards:list", []), opts);
+  if (!onStage(card)) throw new Error(`Card ${cardId} is still with its author (${card.awaiting}). Infinitary takes an answer once it shows the card; the relay sends it then.`);
   const action = card.actions?.find((a) => a.id === actionId);
   if (!action) throw new Error(`Card ${cardId} has no button ${actionId}.`);
   const effect = effectOf(action);
@@ -108,9 +110,6 @@ async function confirmPress(call, card, action, checked) {
   const how = end.how === "chose" ? `"${end.label ?? end.actionId}" was chosen` : `it ended (${end.how})`;
   return { ok: false, refusal: `The card had already ended in Infinitary before this press: ${how}. Your press changed nothing.` };
 }
-
-/** Whether the captain's own stage shows the card (Infinitary's onStage, src/shared/cards.ts). */
-const onStage = (card) => card.awaiting === undefined || card.sentBackAt !== undefined;
 
 /**
  * Acknowledges one note: Infinitary's own close (the captain's ×) on the exact version read.

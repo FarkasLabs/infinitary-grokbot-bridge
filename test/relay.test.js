@@ -89,3 +89,39 @@ test("a refused send is not marked sent, so the next look tries again; receipts 
   assert.equal(r.sent.length, 1);
   assert.doesNotMatch(readFileSync(join(r.dir, "relay.json"), "utf8"), /Bearer|token/i);
 });
+
+// Intent: GRBP-17. Infinitary keeps a crewmate's new card off the captain's stage (awaiting set,
+// no sentBackAt) until the crewmate closes out, and refuses a choice on it; the relay must not
+// offer it early, and must offer it once when it reaches the stage even though its offer is unchanged.
+test("a card still with its author is held, then sent once when it reaches the stage with the same offer", async () => {
+  const r = rig();
+  const held = card("1", { awaiting: "close-out" });
+  await r.relay.onCards([held, card("2")]);
+  assert.equal(r.sent.length, 1, "only the card on the stage goes");
+  assert.match(r.sent[0], /Card 2/);
+  assert.equal(r.relay.sent["1"], undefined);
+  await r.relay.onCards([held, card("2")]);
+  assert.equal(r.sent.length, 1, "still held");
+  const released = card("1", { awaiting: "close-out", sentBackAt: 9 });
+  assert.equal(released.offerId, held.offerId, "a close-out does not change the offer");
+  await r.relay.onCards([released, card("2")]);
+  assert.equal(r.sent.length, 2);
+  assert.match(r.sent[1], /^Decision/, "first delivery, not marked Updated");
+  assert.match(r.sent[1], /Card 1/);
+  await r.relay.onCards([released, card("2")]);
+  assert.equal(r.sent.length, 2, "not again");
+  assert.equal(r.make().sent["1"], "1-v1", "the receipt survives a restart");
+});
+
+test("a held card withdrawn before it reached the stage is never sent", async () => {
+  const r = rig();
+  await r.relay.onCards([card("1", { awaiting: "close-out" })]);
+  await r.relay.onCards([]);
+  assert.equal(r.sent.length, 0);
+});
+
+test("a card that closed out before the relay first looked is sent as soon as it is seen", async () => {
+  const r = rig();
+  await r.relay.onCards([card("1", { awaiting: "answer", sentBackAt: 5 })]);
+  assert.equal(r.sent.length, 1);
+});

@@ -114,6 +114,12 @@ export function htmlToText(html) {
 export const kindOf = (card) =>
   !card.actions?.length ? "Note" : card.author === "host" ? "Attention" : "Decision";
 
+/**
+ * Whether Infinitary's own stage shows the card (onStage, src/shared/cards.ts). A crewmate's
+ * new card waits off the stage until its author closes out, and Infinitary refuses a choice on it.
+ */
+export const onStage = (card) => card.awaiting === undefined || card.sentBackAt !== undefined;
+
 /** Whether the card needs an answer from the captain. */
 export const needsAnswer = (card) => (card.actions?.length ?? 0) > 0;
 
