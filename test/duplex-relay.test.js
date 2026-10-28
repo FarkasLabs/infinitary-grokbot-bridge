@@ -9,6 +9,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { claim, finish, textPrint, answersPrint } from "../src/requests.js";
 import { Relay } from "../src/relay.js";
+import { readJson, receiptsPath } from "../src/state.js";
 import { card } from "./standin.js";
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -409,10 +410,81 @@ test("R18: cards that vanish before ever being receipted (streaming, or rejected
   await r.relay.onUp(r.reads);
   r.mode = "refuse";
   await r.relay.onCards([live(card("1", { status: "streaming" })), live(card("2"))]);
-  assert.equal(r.relay.latest.size, 2);
+  assert.deepEqual(Object.keys(r.relay.meta).sort(), ["1", "2"], "known while a list shows them");
   r.relay.onDown();
   await r.relay.onUp(r.reads);
   await r.relay.onCards([]);
-  assert.equal(r.relay.latest.size, 0);
+  assert.deepEqual(Object.keys(r.relay.meta), []);
+  assert.deepEqual(readJson(receiptsPath(r.dir), {}).meta, {}, "nothing saved for them either");
   assert.deepEqual(Object.keys(r.relay.sent), []);
+});
+
+// R17 (review at cfd570d): the descriptor of a card Grok bot was told of follows the newest list the moment it arrives,
+// whether or not the newer version was delivered and whatever work is still queued. A rejected newer offer, a held queue
+// and a reconnect (or a restart) used to leave the older offer saved, so Grok bot's own accepted answer to the newer one
+// was reported back as an action taken in Infinitary.
+const newer = live(card("1", { offerId: "1-v2", lifecycleId: "1-l2" }));
+const crowded = [newer, ...["2", "3", "4", "5", "6", "7"].map((id) => live(card(id)))]; // card 1, the oldest, goes in the summary
+
+async function rejectedNewerOfferWhileHeld(r, label, list, deliver) {
+  await r.relay.onUp(r.reads);
+  await r.relay.onCards([live()]); // card 1 at offer 1-v1, delivered and receipted
+  await r.relay.idle();
+  const release = blockQueue(r, label); // a running command holds the ordered queue
+  const attempts = [];
+  const accept = (m) => (r.sent.push(m), { ok: true, status: 200 });
+  r.mode = (m) => (attempts.push(m), deliver(m) ? accept(m) : { ok: false, status: 403, rejected: true });
+  const arriving = r.relay.onCards(list);
+  const savedOnArrival = readJson(receiptsPath(r.dir), {}).meta?.["1"];
+  await arriving; // the webhook definitely refused the newer offer
+  r.mode = "ok";
+  return { release, attempts, savedOnArrival };
+}
+
+async function acceptedAnswerToNewerOfferEnds(r, relay, request) {
+  const edge = relay.s.connectedAt;
+  const done = claim(r.dir, request, `p-${request}`, { subject: { kind: "answer", cardId: "1", lifecycleId: "1-l2", offerId: "1-v2", actionId: "go", answersFp: answersPrint([]) }, holdMs: 60000 });
+  finish(done.path, { ok: true }, { outcome: "accepted" });
+  r.reads.past = async (id) => (id === "1" ? { id, title: "Card 1", ending: { how: "chose", actionId: "go", label: "Go", by: "captain", at: edge + 1000 } } : null);
+  const before = r.sent.length;
+  await relay.onCards([]); // the new connection's first list: card 1 has ended
+  await relay.idle();
+  return r.sent.slice(before);
+}
+
+test("R17: a newer offer the webhook rejects while the queue is held is still the card's descriptor after a reconnect, so Grok bot's accepted answer to it is not echoed (single card)", async () => {
+  const r = rig();
+  const { release, attempts, savedOnArrival } = await rejectedNewerOfferWhileHeld(r, "rej-single", [newer], (m) => !/1-v2/.test(m));
+  assert.ok(attempts.some((m) => /offer 1-v2/.test(m)), "the newer offer was tried and refused");
+  r.relay.onDown(); // the queued work belongs to the replaced connection and is dropped
+  await r.relay.onUp(r.reads);
+  release();
+  const said = await acceptedAnswerToNewerOfferEnds(r, r.relay, "answer-rej-single");
+  assert.deepEqual(said, [], "Grok bot's own accepted answer to the newest offer is not echoed");
+  assert.equal(savedOnArrival?.offerId, "1-v2", "saved the moment the list arrived, before any delivery or queued work");
+  assert.equal(savedOnArrival?.lifecycleId, "1-l2");
+});
+
+test("R17: the same when the newer offer was only in the rejected summary of cards not sent in full", async () => {
+  const r = rig();
+  const { release, attempts, savedOnArrival } = await rejectedNewerOfferWhileHeld(r, "rej-summary", crowded, (m) => !/not sent in full/.test(m));
+  assert.ok(attempts.some((m) => /not sent in full/.test(m) && /\(card 1\)/.test(m)), "card 1 was only in the refused summary");
+  r.relay.onDown();
+  await r.relay.onUp(r.reads);
+  release();
+  const said = await acceptedAnswerToNewerOfferEnds(r, r.relay, "answer-rej-summary");
+  assert.deepEqual(said, [], "Grok bot's own accepted answer to the newest offer is not echoed");
+  assert.equal(savedOnArrival?.offerId, "1-v2");
+});
+
+test("R17: the same across a restart of the bridge instead of a reconnect", async () => {
+  const r = rig();
+  const { release, savedOnArrival } = await rejectedNewerOfferWhileHeld(r, "rej-restart", [newer], (m) => !/1-v2/.test(m));
+  r.relay.onDown(); // the old process's queued work never runs
+  release();
+  const restarted = new Relay({ dir: r.dir, send: r.send, enabled: () => true, epoch: () => 0, pollMs: 5, reads: r.reads });
+  await restarted.onUp(r.reads);
+  const said = await acceptedAnswerToNewerOfferEnds(r, restarted, "answer-rej-restart");
+  assert.deepEqual(said, [], "Grok bot's own accepted answer to the newest offer is not echoed");
+  assert.equal(savedOnArrival?.offerId, "1-v2");
 });
