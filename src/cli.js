@@ -2,7 +2,7 @@ import { spawn, execFile } from "node:child_process";
 import { rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { parseArgs, promisify } from "node:util";
-import { answerCard, replyToCard, sayToFirstMate } from "./act.js";
+import { ackNote, answerCard, replyToCard, sayToFirstMate } from "./act.js";
 import { daemonAlive, runDaemon, statusPath } from "./daemon.js";
 import { HomeLink, openActLink } from "./home.js";
 import { cardPage } from "./page.js";
@@ -21,13 +21,15 @@ const USAGE = `grokbot-bridge <command>
                           press a button of the card's current offer; JSON {"answers":[{name,values,written}]} on stdin
   reply <card-id> --offer O --lifecycle L --request R [--wait s]
                           reply in the card's thread (text on stdin); prints any answer that arrives
+  ack <card-id> --offer O --lifecycle L --request R
+                          acknowledge (close) a note that needs no answer; only on the user's thumbs-up to that note
   say --request R [--wait s]       message the first mate (text on stdin); prints its answer
   last                    the first mate's latest answer
   pair                    pair once with this computer's Infinitary (reads a link from stdin,
                           or runs 'infinitary link --json' with --from-infinitary)
   unpair                  forget the local key (also remove the device in Settings -> Devices)
   run                     the background part (started by 'on' when it is not running)
-answer, reply and say act as you and need the switch on. --request is a fresh id (8-64 of A-Za-z0-9_-);
+answer, reply, ack and say act as you and need the switch on. --request is a fresh id (8-64 of A-Za-z0-9_-);
 the same id sent again does nothing twice. A merge, discard or kept write also needs --confirm.`;
 
 const FLAGS = {
@@ -170,6 +172,14 @@ export async function main(argv, { out = (s) => process.stdout.write(`${s}\n`), 
         });
         out(`${r.replayed ? "Already sent. " : "Reply sent. "}${r.answers.length ? "" : "No answer yet; 'show' reads the thread."}`.trim());
         for (const a of r.answers) out(`${a.who}: ${a.text}`);
+      });
+    }
+    case "ack": {
+      const { values, positionals } = parseArgs({ args: rest, options: FLAGS, allowPositionals: true });
+      return withActHome(dir, async (link) => {
+        const r = await ackNote(link, dir, { cardId: positionals[0], offerId: values.offer, lifecycleId: values.lifecycle, requestId: values.request });
+        if (!r.ok) return out(`Not acknowledged: ${r.refusal}`);
+        out(`${r.replayed ? "Already done: " : ""}Acknowledged note ${positionals[0]}; Infinitary closed it.`);
       });
     }
     case "say": {

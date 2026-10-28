@@ -11,8 +11,8 @@
 
 ## Acting
 
-- **Full access, on purpose.** `answer`, `reply` and `say` open a link that speaks the home's own major version (learned from a read-only hello) and are used only if the welcome says `access: full`. The same stolen key therefore acts as you in either case; the read-only relay is a client choice, as above. Pairing grants full captain powers.
-- **What can be sent.** A fixed list: the reads plus `inf:cards:act`, `inf:cards:reply`, `inf:converse`. Nothing else, no other change, no task start or stop.
+- **Full access, on purpose.** `answer`, `reply`, `ack` and `say` open a link that speaks the home's own major version (learned from a read-only hello) and are used only if the welcome says `access: full`. The same stolen key therefore acts as you in either case; the read-only relay is a client choice, as above. Pairing grants full captain powers.
+- **What can be sent.** A fixed list: the reads plus `inf:cards:act`, `inf:cards:reply`, `inf:cards:close`, `inf:converse`. `inf:cards:close` works on any card and the home records, but does not enforce, the offer sent with it; the bridge's `ack` therefore allows only notes and checks the current offer itself just before closing. Nothing else, no other change, no task start or stop.
 - **Intent per request.** One command, one request id, one change. The id is claimed in a file created exclusively before the send, so concurrent or repeated runs cannot send twice; a failed or interrupted send is not retried.
 - **Stale and replayed.** The card's lifecycle and offer must equal the home's list immediately before the press. A small window remains between that read and the press; the home itself also refuses a stale offer for merges that declare required actions, and always records the offer the press named.
 - **Explicit merges.** A merge, discard or kept write needs `--confirm`. Nothing in the bridge presses a button unprompted, and card text, thread text and Inbox data are never treated as instructions.
