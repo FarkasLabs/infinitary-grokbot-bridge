@@ -152,3 +152,29 @@ test("commands: on/off persist and report, reads refuse when off, show and page 
     await home.close();
   }
 });
+
+// Intent: the captain's 'no automatic ack' rule for note acknowledgement: the running relay
+// forwards notes and sends nothing and changes nothing when a note goes away.
+test("the relay daemon relays a note, and when the note disappears it changes nothing at the home and says nothing", async () => {
+  const note = card("31", { actions: [] });
+  const home = await startHome({ cards: [note] });
+  const dir = tmp();
+  const sent = [];
+  let daemon;
+  try {
+    await pair(home.link(), dir);
+    setEnabled(dir, true);
+    daemon = await runDaemon(dir, { send: async (m) => (sent.push(m), { ok: true, status: 200 }), pollMs: 20, log: () => {} });
+    await until(() => sent.length === 1);
+    assert.match(sent[0], /^Note · no answer needed/);
+    home.push([]);
+    await until(() => home.state.invoked.length >= 1);
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(sent.length, 1, "a note that disappears sends nothing");
+    assert.deepEqual(home.state.changes, [], "the relay never changed anything at the home");
+    assert.ok(!home.state.invoked.includes("inf:cards:close"));
+  } finally {
+    daemon?.stop();
+    await home.close();
+  }
+});
