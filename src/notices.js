@@ -35,4 +35,4 @@ export const threadAnswerNotice = (card, m) =>
 export const turnNotice = (text) => `In Infinitary · you told the first mate: ${text}`;
 export const replyNotice = (text) => `In Infinitary · the first mate answered: ${text}`;
 export const mergeResultNotice = (title) => `Merge result · ${quote(title)} is merged.`;
-export const mergeUpdateNotice = (title, text) => `Merge update · ${quote(title)}: Infinitary says: ${text}`;
+export const mergeRefusedNotice = (title, text) => `Merge refused · ${quote(title)}: Infinitary says: ${text}`;

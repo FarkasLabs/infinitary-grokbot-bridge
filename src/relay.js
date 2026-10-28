@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { readJson, receiptsPath, writePrivate } from "./state.js";
 import { effectOf } from "./act.js";
-import { commentNotice, endingNotice, endingWhat, mergeResultNotice, mergeUpdateNotice, replyNotice, threadAnswerNotice, turnNotice, unclearNotice } from "./notices.js";
+import { commentNotice, endingNotice, endingWhat, mergeRefusedNotice, mergeResultNotice, replyNotice, threadAnswerNotice, turnNotice, unclearNotice } from "./notices.js";
 import { answersPrint, claimMarker, hasMarker, readRequests, textPrint } from "./requests.js";
 import { cardMessage, chunk } from "./text.js";
 
@@ -40,19 +40,19 @@ export class Relay {
     this.outbox = [];
     this.flushing = Promise.resolve();
     this.seq = 0;
+    this.cardsRun = Promise.resolve();
     this.s = this.#fresh();
   }
 
   /**
    * The switch. Any write to it (off, or off and on again between two looks) is a transition that drops the
-   * notices waiting for a retry: they belong to the time it was on before.
+   * notices waiting for a retry: they belong to the time it was on before. The connection and its session stay.
    */
   enabled() {
     const epoch = this.epoch();
     if (epoch !== this.seenEpoch) {
       this.seenEpoch = epoch;
       this.outbox = this.outbox.filter((n) => n.inflight);
-      this.s = this.#fresh();
     }
     return this.isEnabled();
   }
@@ -62,7 +62,7 @@ export class Relay {
    * the session it was received in and does nothing once another has replaced it, so nothing carries over a reset.
    */
   #fresh(up = false, reads = this.reads) {
-    return { up, reads, known: new Map(), lastLine: new Map(), seen: new Set(), early: new Map(), baseline: new Map(), merges: new Map(), baselined: false, connectedAt: up ? Date.now() : Infinity };
+    return { up, reads, known: new Map(), lastLine: new Map(), seen: new Set(), introduced: new Map(), baseline: new Map(), merges: new Map(), baselined: false, connectedAt: up ? Date.now() : Infinity };
   }
 
   #alive = (s) => this.s === s && s.up;
@@ -159,8 +159,9 @@ export class Relay {
 
   /** The cards the home shows now: on connect, on switch-on, and with every change. */
   onCards(cards) {
-    const run = this.#cards(this.s, cards);
-    this.cardsRun = run.catch(() => {});
+    const s = this.s;
+    const run = this.cardsRun.then(() => this.#cards(s, cards));
+    this.cardsRun = run.catch((e) => this.log(e.message));
     return run;
   }
 
@@ -172,11 +173,11 @@ export class Relay {
       // Noted the moment they arrive, so what is said under a new card is never taken for its history.
       const first = !s.baselined;
       s.baselined = true;
-      for (const id of s.seen) if (!live.has(id)) (s.seen.delete(id), s.early.delete(id));
+      for (const id of s.seen) if (!live.has(id)) (s.seen.delete(id), s.introduced.delete(id));
       for (const c of cards) {
         if (s.seen.has(c.id)) continue;
         s.seen.add(c.id);
-        s.early.set(c.id, new Set());
+        s.introduced.set(c.id, Date.now());
         s.baseline.set(c.id, this.#baseline(s, c.id, first ? undefined : 0));
       }
       // Card state changes in the same order as thread and event handling, so a queued update still finds its card.
@@ -186,6 +187,7 @@ export class Relay {
           if (live.has(id)) continue;
           s.known.delete(id);
           if (id in this.sent) await this.#ending(s, gone);
+          if (!this.#alive(s)) return;
           s.lastLine.delete(id);
         }
         for (const c of cards) s.known.set(c.id, c);
@@ -212,6 +214,7 @@ export class Relay {
 
   /** The home was reached; `reads` are the reads of that very connection. Says it is back only if it said it went away. */
   async onUp(reads = this.reads) {
+    this.enabled(); // a switch write seen now belongs to the time before this connection
     this.downSince = null;
     this.s = this.#fresh(true, reads);
     await this.#flush();
@@ -231,6 +234,7 @@ export class Relay {
 
   /** The switch was seen going off: nothing waiting is sent when it comes back on. */
   onOff() {
+    this.seenEpoch = this.epoch();
     this.outbox = this.outbox.filter((n) => n.inflight);
     this.s = this.#fresh();
     this.downSince = null;
@@ -255,21 +259,19 @@ export class Relay {
   // --- What happened in Infinitary itself, while connected. ---
 
   /**
-   * Where a new card's thread stands, read the moment the card is seen. A line that came under it since is news: a push
-   * observed before the read answers names the newest line, which the baseline stays below.
+   * Where a new card's thread stands, read the moment the card is seen: lines written before then are history, however
+   * often Infinitary publishes them again; a line written since is news. Message ids ascend with their time.
    */
   async #baseline(s, id, fallback) {
+    const since = s.introduced.get(id) ?? Date.now();
     let at;
     try {
       const thread = await s.reads.thread?.(id);
-      at = (thread?.messages ?? []).reduce((m, x) => Math.max(m, Number(x.id) || 0), 0);
+      at = (thread?.messages ?? []).filter((m) => (m.at ?? 0) < since).reduce((m, x) => Math.max(m, Number(x.id) || 0), 0);
     } catch (e) {
       this.log(`thread read: ${e.message}`);
       at = fallback;
     }
-    const early = s.early.get(id);
-    s.early.delete(id);
-    if (at !== undefined && early?.size) at = Math.min(at, Math.min(...early) - 1);
     if (this.#alive(s) && at !== undefined) s.lastLine.set(id, at);
   }
 
@@ -324,9 +326,11 @@ export class Relay {
   }
 
   /**
-   * What became of a requested merge, read from the task itself (by its identity), never guessed from a title: merged
-   * once it is closed as merged or landed; otherwise the host's own notes on that task since the click, each once. An
-   * unrelated event, or a task failure, reports nothing.
+   * What became of a requested merge, read from the task itself (by its identity) and only from records Infinitary
+   * labels as the merge's: the task closed as merged or landed (or its merged/landed timeline event), and the
+   * host's refusal note marked `refused: merge-pr` or `land` since the click. Approval bookkeeping, other host notes,
+   * a task failure and anyone else's notes are not merge outcomes. Infinitary labels no merged reference to a pull
+   * request as the merge's, so that case is not reported (see the README).
    */
   async #merge(s, taskId) {
     const m = s.merges.get(taskId);
@@ -338,23 +342,22 @@ export class Relay {
       return void this.log(`task read: ${e.message}`);
     }
     if (!this.#alive(s) || !task || m.finished) return;
-    if (task.status === "done" && ["merged", "landed"].includes(task.closedReason)) {
+    const events = [...(task.events ?? [])].sort((a, b) => a.id - b.id);
+    if ((task.status === "done" && ["merged", "landed"].includes(task.closedReason)) || events.some((ev) => ["merged", "landed"].includes(ev.kind))) {
       m.finished = true;
       return void (await this.#notify(`merge:${taskId}:result`, mergeResultNotice(m.title)));
     }
-    for (const ev of [...(task.events ?? [])].sort((a, b) => a.id - b.id)) {
+    for (const ev of events) {
       if (ev.actor !== "host" || ev.kind !== "note" || ev.at < m.clickedAt || m.reported.has(ev.id) || !ev.text) continue;
+      if (!["merge-pr", "land"].includes(ev.data?.refused)) continue;
       m.reported.add(ev.id);
-      await this.#notify(`merge:${taskId}:update:${ev.id}`, mergeUpdateNotice(m.title, ev.text));
+      await this.#notify(`merge:${taskId}:refused:${ev.id}`, mergeRefusedNotice(m.title, ev.text));
     }
   }
 
   /** A card's thread changed (inf:cards:thread). */
   onThread(thread) {
     const s = this.s;
-    // A push seen before a new card's baseline is read names its newest line, which must stay news.
-    const early = s.early.get(thread?.cardId);
-    if (early) early.add((thread.messages ?? []).reduce((m, x) => Math.max(m, Number(x.id) || 0), 0));
     return this.#serial(async () => {
       await this.cardsRun;
       await s.baseline.get(thread?.cardId);
