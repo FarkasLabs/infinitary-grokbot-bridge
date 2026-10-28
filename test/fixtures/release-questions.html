@@ -1,0 +1,26 @@
+<h3>Questions, with the answer I would give</h3>
+<p>Question 1 needs your pick, because only you know where this build should go. Questions 2 and 3 left unpicked take the recommended answer.</p>
+
+<fieldset>
+<legend>1. Where should this build be deployed?</legend>
+<label><input type="radio" name="target" value="staging" required data-inf-recommended> To the staging environment</label>
+<label><input type="radio" name="target" value="production" required> To production, right away</label>
+<label><input type="radio" name="target" value="canary" required> To a canary group of 5% of users first</label>
+<label><input type="radio" name="target" value="other" required data-inf-write-in> Something else</label>
+</fieldset>
+<p class="inf-muted">The checks passed, so I would pick staging first and promote it after a day without errors.</p>
+
+<fieldset>
+<legend>2. What should the release notes contain?</legend>
+<label><input type="radio" name="notes" value="changelog-and-upgrade" data-inf-recommended> The full changelog plus upgrade steps</label>
+<label><input type="radio" name="notes" value="changelog-only"> The full changelog only</label>
+<label><input type="radio" name="notes" value="other" data-inf-write-in> Something else</label>
+</fieldset>
+<p class="inf-muted">I would add the upgrade steps, since this release changes a setting name.</p>
+
+<fieldset>
+<legend>3. Who should be told when the deploy finishes?</legend>
+<label><input type="radio" name="notify" value="team-channel" data-inf-recommended> The team channel, even when it succeeds</label>
+<label><input type="radio" name="notify" value="failures-only"> Only people on call, and only if it fails</label>
+<label><input type="radio" name="notify" value="other" data-inf-write-in> Something else</label>
+</fieldset>

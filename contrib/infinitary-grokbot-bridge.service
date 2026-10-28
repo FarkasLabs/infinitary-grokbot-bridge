@@ -1,0 +1,13 @@
+# Install: cp this file to ~/.config/systemd/user/, then set ExecStart to the
+# absolute path of the installed command:
+#   sed -i "s|^ExecStart=.*|ExecStart=$(command -v grokbot-bridge) run|" ~/.config/systemd/user/infinitary-grokbot-bridge.service
+[Unit]
+Description=Infinitary to Grok bot bridge
+
+[Service]
+ExecStart=/usr/bin/env grokbot-bridge run
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
