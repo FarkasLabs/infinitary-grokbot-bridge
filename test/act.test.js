@@ -286,7 +286,7 @@ test("a required textarea preserves its initial answer and unchanged submissions
   ]);
 });
 
-// Intent: the captain's request to acknowledge a relayed note from Grok Bot with an 'ack' command
+// Intent: the captain's request (GRBP-8, as changed to an explicit Acknowledge / Remind me later choice) to acknowledge a relayed note from Grok Bot with an 'ack' command
 // that keeps the offer/lifecycle checks, fails closed on stale or repeated requests, and never acts by itself.
 const note = card("21", { actions: [] });
 const required = [{ id: "x", target: "t", title: "Do it", consequence: "c", instructions: ["i"], criterion: "k", prerequisites: [], completion: { kind: "manual", label: "done" } }];

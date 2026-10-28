@@ -22,7 +22,7 @@ const USAGE = `grokbot-bridge <command>
   reply <card-id> --offer O --lifecycle L --request R [--wait s]
                           reply in the card's thread (text on stdin); prints any answer that arrives
   ack <card-id> --offer O --lifecycle L --request R
-                          acknowledge (close) a note that needs no answer; only on the user's thumbs-up to that note
+                          acknowledge (close) a note that needs no answer; only when the user picked Acknowledge for that note
   say --request R [--wait s]       message the first mate (text on stdin); prints its answer
   last                    the first mate's latest answer
   pair                    pair once with this computer's Infinitary (reads a link from stdin,
