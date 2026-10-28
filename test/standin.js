@@ -90,6 +90,7 @@ export async function startHome({ cards = [] } = {}) {
           };
           if (f.channel === "inf:cards:list") reply(state.cards);
           else if (f.channel === "inf:cards:thread") reply({ cardId: f.args[0], messages: state.threads?.[f.args[0]] ?? [] });
+          else if (f.channel === "inf:tasks:detail") reply(state.tasks?.[f.args[0]] ?? null);
           else if (f.channel === "inf:cards:past") reply(state.past?.[f.args[0]] ?? null);
           else if (f.channel === "inf:cards:picture") reply({ contentType: "image/png", data: "iVBORw0KGgo=" });
           else if (f.channel === "inf:conversation:last-turn") reply(state.lastTurn ?? null);

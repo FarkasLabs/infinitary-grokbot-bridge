@@ -173,22 +173,27 @@ test("conversation: your message to the first mate and its answer are sent; thos
   }
 });
 
-test("merge: the click says merge requested, never merged; a merged closure is the result, also when it comes before the card's removal", async () => {
+// Task details shaped like Infinitary's inf:tasks:detail: the task has its own title, and its timeline holds the host's notes.
+const taskOf = (id, over = {}) => ({ id, key: `T-${id}`, title: `Task ${id} as the task is named`, status: "open", closedReason: null, events: [], ...over });
+const hostNote = (id, text, over = {}) => ({ id, at: Date.now() + 1000, actor: "host", kind: "note", text, data: null, ref: null, feed: true, ...over });
+const taskChanged = (taskId, closedReason = null) => ({ type: "task_changed", taskId, key: "T", kind: "work", status: closedReason ? "done" : "open", from: "open", activity: null, closedReason, seq: 1 });
+
+test("merge: the click says merge requested, never merged; the task closing as merged is the result, also when it came before the card's removal", async () => {
   const r = await rig([mergeCard, { ...mergeCard, id: "12", taskId: "t12", offerId: "12-v1", lifecycleId: "12-l1" }]);
-  const closed = (taskId, seq) => ({ type: "task_changed", taskId, key: "T", kind: "work", status: "done", from: "open", activity: null, closedReason: "merged", seq });
+  r.home.state.tasks = { t9: taskOf("t9"), t12: taskOf("t12", { status: "done", closedReason: "merged" }) };
   try {
     r.home.state.endCard("9", { how: "chose", actionId: "merge", by: "captain" });
     await until(() => r.news().length === 1);
     assert.match(r.news()[0], /^In Infinitary · you pressed "Merge the pull request" on "Ready to merge" \(card 9\): merge requested\. It is not merged yet/);
-    r.home.state.pushEvent(closed("t9", 3));
+    r.home.state.tasks.t9 = taskOf("t9", { status: "done", closedReason: "merged" });
+    r.home.state.pushEvent(taskChanged("t9", "merged"));
     await until(() => r.news().length === 2);
     assert.equal(r.news()[1], 'Merge result · "Ready to merge" is merged.');
-    // Grok bot requests the merge: its click is silent. Infinitary publishes the merged result before the card's removal.
-    r.home.state.pushEvent(closed("t12", 4));
+    // Grok bot requests the merge: its click is silent; the task had already closed before the card's removal was published.
     await r.run(["answer", "12", "merge", "--offer", "12-v1", "--lifecycle", "12-l1", "--request", "req-hhhhhhhh", "--confirm"]);
     await until(() => r.news().length === 3);
     assert.equal(r.news()[2], 'Merge result · "Ready to merge" is merged.');
-    r.home.state.pushEvent(closed("t12", 5));
+    r.home.state.pushEvent(taskChanged("t12", "merged"));
     await r.quiet();
     assert.equal(r.news().length, 3, "each merge reports once");
   } finally {
@@ -196,21 +201,33 @@ test("merge: the click says merge requested, never merged; a merged closure is t
   }
 });
 
-test("merge: a task failure is not a merge failure; Infinitary's own note about the request is passed on once, in its words", async () => {
-  const r = await rig([mergeCard]);
+test("merge: only the host's notes on that very task since the click are passed on, each once, whichever side of the card's removal they fall; a task failure is not a merge failure", async () => {
+  const r = await rig([mergeCard, { ...mergeCard, id: "12", taskId: "t12", offerId: "12-v1", lifecycleId: "12-l1" }]);
+  const refusal = hostNote(5, "Cannot merge: checks have not passed.", { feed: false, data: { refused: "merge-pr" } });
+  r.home.state.tasks = {
+    t9: taskOf("t9", { events: [hostNote(1, "An older host note", { at: 1 }), { ...hostNote(2, "crewmate progress"), actor: "crewmate" }] }),
+    t12: taskOf("t12", { events: [hostNote(7, "Merged pull request #4 (referenced).")] }),
+  };
   try {
     r.home.state.endCard("9", { how: "chose", actionId: "merge", by: "captain" });
     await until(() => r.news().length === 1);
+    r.home.state.tasks.t9.events.push({ ...hostNote(3, "Failed: the crewmate stopped"), kind: "failed" });
     r.home.state.pushEvent({ type: "task_event", taskId: "t9", key: "T-9", kind: "failed", text: "Failed: the crewmate stopped", at: 1, feed: true });
-    r.home.state.pushEvent({ type: "firstmate_note", text: 'Putting the change in for "Ready to merge" - the result will appear here.' });
+    r.home.state.pushEvent({ type: "task_event", taskId: "t9", key: "T-9", kind: "note", text: "crewmate progress", at: 1, feed: true });
+    r.home.state.pushEvent({ type: "firstmate_note", text: 'Merge refused for "Task t9 as the task is named" - not for any card title.' });
     await r.quiet();
-    assert.equal(r.news().length, 1, "neither a crewmate failure nor the acknowledgement is a merge result");
-    r.home.state.pushEvent({ type: "firstmate_note", text: 'Merge refused for "Ready to merge": checks have not passed.' });
-    r.home.state.pushEvent({ type: "task_event", taskId: "t9", key: "T-9", kind: "note", text: "Refused again", at: 2, feed: true });
+    assert.equal(r.news().length, 1, "nothing unrelated was taken for the merge outcome, and nothing was used up");
+    r.home.state.tasks.t9.events.push(refusal);
+    r.home.state.pushEvent({ type: "task_event", taskId: "t9", key: "T-9", kind: "note", text: refusal.text, at: 2, feed: false });
     await until(() => r.news().length === 2);
+    r.home.state.pushEvent({ type: "task_event", taskId: "t9", key: "T-9", kind: "note", text: refusal.text, at: 2, feed: false });
     await r.quiet();
     assert.equal(r.news().length, 2);
-    assert.equal(r.news()[1], 'Merge update · "Ready to merge": Infinitary says: Merge refused for "Ready to merge": checks have not passed.');
+    assert.equal(r.news()[1], 'Merge update · "Ready to merge": Infinitary says: Cannot merge: checks have not passed.');
+    // A referenced pull request merged before the card's removal was published: its note is found when tracking starts.
+    await r.run(["answer", "12", "merge", "--offer", "12-v1", "--lifecycle", "12-l1", "--request", "req-mmmmmmmm", "--confirm"]);
+    await until(() => r.news().length === 3);
+    assert.equal(r.news()[2], 'Merge update · "Ready to merge": Infinitary says: Merged pull request #4 (referenced).');
   } finally {
     await r.done();
   }

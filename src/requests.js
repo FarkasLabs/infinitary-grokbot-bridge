@@ -91,7 +91,7 @@ export function claimMarker(path, name) {
 }
 
 export function finish(path, result, patch = {}) {
-  mark(path, { state: "done", result, ...patch });
+  mark(path, { state: "done", result, doneAt: Date.now(), ...patch });
 }
 
 /** Every request record in the state folder; the relay matches what it sees against them. */
