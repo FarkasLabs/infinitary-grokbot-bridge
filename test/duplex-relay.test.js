@@ -41,7 +41,7 @@ const live = (c = card("1")) => ({ ...c, taskId: "t1" });
 test("R1: a comment already received when a new card's baseline read finishes is still news", async () => {
   const gate = deferred();
   const r = rig();
-  const written = Date.now() + 50;
+  const written = Date.now() + 60000; // after the card is seen, however slow the machine
   r.reads.thread = async () => (await gate.promise, { messages: [{ id: 1, who: "captain", text: "first words", at: written }] });
   await r.relay.onUp(r.reads);
   await r.relay.onCards([]);
@@ -154,7 +154,7 @@ test("R14: Infinitary republishing a new card's existing thread is history, not 
   const sentCard = r.sent.length;
   await r.relay.onThread({ cardId: "1", messages: [{ id: 4, who: "captain", text: "typed while the bridge was off", at: Date.now() - 60000 }] });
   assert.equal(r.sent.length, sentCard, "a republished snapshot is not news");
-  await r.relay.onThread({ cardId: "1", messages: [{ id: 4, who: "captain", text: "typed while the bridge was off", at: Date.now() - 60000 }, { id: 5, who: "captain", text: "now", at: Date.now() }] });
+  await r.relay.onThread({ cardId: "1", messages: [{ id: 4, who: "captain", text: "typed while the bridge was off", at: Date.now() - 60000 }, { id: 5, who: "captain", text: "now", at: Date.now() + 60000 }] });
   assert.equal(r.sent.length, sentCard + 1);
   assert.match(r.sent.at(-1), /: now$/);
 });
@@ -176,7 +176,7 @@ test("R12: a card pass begun on a replaced connection does not delete or overwri
   await r.relay.idle();
   assert.equal(r.relay.sent["1"], "1-v1", "the new connection's receipt survives");
   assert.equal(r.sent.length, cardSent, "the card is not sent again");
-  await r.relay.onThread({ cardId: "1", messages: [{ id: 1, who: "captain", text: "after reconnect", at: Date.now() + 5 }] });
+  await r.relay.onThread({ cardId: "1", messages: [{ id: 1, who: "captain", text: "after reconnect", at: Date.now() + 60000 }] });
   assert.match(r.sent.at(-1), /after reconnect/, "its thread is still followed");
 });
 
@@ -201,7 +201,7 @@ test("R1: a comment typed after a snapshot named a card is news even while an ea
 test("R1: a comment on a card pushed before the card list is read is kept and reported once the card is known", async () => {
   const r = rig();
   await r.relay.onUp(r.reads);
-  const first = { id: 1, who: "captain", text: "typed during connect", at: Date.now() + 5 };
+  const first = { id: 1, who: "captain", text: "typed during connect", at: Date.now() + 60000 };
   r.reads.thread = async () => ({ messages: [] });
   r.relay.onThread({ cardId: "1", messages: [first] });
   await r.relay.onCards([live()]);
