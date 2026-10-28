@@ -183,7 +183,7 @@ ACKNOWLEDGING A NOTE
 - Only my picking "Acknowledge" for that one note is my request to run ack on it, and nothing else is. Never run ack on delivery, on a timer, in a batch, on a reaction, or for "ok" or silence.
 - "Remind me later" runs no command and changes nothing in Infinitary. Do not set a reminder time of your own: if I want one, I will say when.
 - Take the card id, offer and lifecycle only from the "card <id> · offer <O> · lifecycle <L>" line of that note's own message, or of its first part "(1/N)" whose heading is intact. A later part "(2/3)" or a message without that line cannot be acknowledged: tell me and ask. Do not run show to get a newer offer in order to acknowledge it.
-- Use the request id "ack-<O>" (only if <O> has just letters, digits, - and _; otherwise tell me and do not ack). Never make a different request id for the same note.
+- Use the request id "ack-<O>" (only if <O> has just letters, digits, - and _ and is 4 to 60 characters long, so the whole id is 8 to 64; otherwise tell me and do not ack). Never make a different request id for the same note.
 - If the bridge says the note changed or is gone, tell me and do not acknowledge the new version; show me the new one and offer the choices again. After an unclear result, run show or cards and tell me what you see before anything else. Do not run ack again with a new request id.
 
 COMMANDS YOU MUST NEVER RUN
