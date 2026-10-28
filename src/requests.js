@@ -18,6 +18,7 @@ export const fingerprint = (parts) => createHash("sha256").update(JSON.stringify
  * One file per request id, created exclusively, so two runs of the same id cannot both send.
  * A change is claimed ("started") before it is sent and finished after the home answered.
  * A claim left "started" means the outcome is unknown: it is never sent again.
+ * `until` (the claim time plus `holdMs`) is the command's deadline, and the relay waits for a running record until then.
  */
 export function claim(stateDir, id, print, { create = true, subject, holdMs = 60000 } = {}) {
   if (!REQUEST_ID.test(id ?? "")) throw new Error("Give --request with a fresh id of 8 to 64 letters, digits, - or _.");
@@ -37,13 +38,14 @@ export function claim(stateDir, id, print, { create = true, subject, holdMs = 60
   } else try {
     // Written whole under a temporary name, then linked into place, so a reader never sees half a record.
     const tmp = `${path}.${process.pid}.new`;
-    writeFileSync(tmp, JSON.stringify({ print, state: "started", at: Date.now(), until: Date.now() + holdMs, subject }), { mode: 0o600 });
+    const at = Date.now();
+    writeFileSync(tmp, JSON.stringify({ print, state: "started", at, until: at + holdMs, subject }), { mode: 0o600 });
     try {
       linkSync(tmp, path);
     } finally {
       rmSync(tmp, { force: true });
     }
-    return { fresh: true, path };
+    return { fresh: true, path, until: at + holdMs };
   } catch (e) {
     if (e.code !== "EEXIST") throw e;
   }

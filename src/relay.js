@@ -53,9 +53,15 @@ export class Relay {
     const epoch = this.epoch();
     if (epoch !== this.seenEpoch) {
       this.seenEpoch = epoch;
-      this.outbox = this.outbox.filter((n) => n.inflight);
+      this.#discard();
     }
     return this.isEnabled();
+  }
+
+  /** What waits is dropped; a notice being sent keeps only the outcome of the chunk on its way, and nothing after it is sent. */
+  #discard() {
+    this.outbox = this.outbox.filter((n) => n.inflight);
+    for (const n of this.outbox) n.cut = true;
   }
 
   /**
@@ -98,10 +104,13 @@ export class Relay {
     writePrivate(receiptsPath(this.dir), JSON.stringify({ sent: this.sent, meta: this.meta, noticeSent: this.noticeSent, ended: this.ended.slice(-200) }));
   }
 
-  /** One chunk. "sent", "rejected" (definitely refused: a settings problem or a 4xx answer), "unknown" (may have been delivered) or "off". */
-  #post(part) {
+  /**
+   * One chunk. "sent", "rejected" (definitely refused: a settings problem or a 4xx answer), "unknown" (may have been delivered)
+   * or "off" (the switch is off, or was written since the notice `of` began).
+   */
+  #post(part, of) {
     const run = this.queue.then(async () => {
-      if (!this.enabled()) return "off";
+      if (!this.enabled() || of?.cut) return "off";
       const r = await this.rawSend(part);
       if (r.ok) return "sent";
       this.log(`webhook send failed: ${r.status ?? r.reason}`);
@@ -158,15 +167,15 @@ export class Relay {
         if (!this.outbox.includes(n)) continue; // the switch check itself discarded it: it is not sent
         n.inflight = true;
         let result = "sent";
-        while (n.next < n.parts.length && result === "sent") {
-          result = await this.#post(n.parts[n.next]);
+        while (n.next < n.parts.length && result === "sent" && !n.cut) {
+          result = await this.#post(n.parts[n.next], n);
           if (result === "sent") n.next += 1;
         }
         n.inflight = false;
-        if (result === "rejected") return;
+        if (result === "rejected" && !n.cut) return;
         drop();
-        if (result === "sent") n.onSent?.();
-        else this.log(`not sure ${n.id} was delivered; not sent again`);
+        if (n.next === n.parts.length) n.onSent?.();
+        else this.log(n.cut ? `${n.id} dropped: the switch was written while it was being sent` : `not sure ${n.id} was delivered; not sent again`);
       }
     });
     this.flushing = run.catch((e) => this.log(e.message));
@@ -224,7 +233,7 @@ export class Relay {
         const early = s.early.get(c.id);
         if (!early) continue;
         s.early.delete(c.id);
-        await this.#threadLines(s, early);
+        await this.#threadLines(s, ...early);
       }
     });
   }
@@ -274,7 +283,7 @@ export class Relay {
   /** The switch was seen going off: nothing waiting is sent when it comes back on. */
   onOff() {
     this.seenEpoch = this.epoch();
-    this.outbox = this.outbox.filter((n) => n.inflight);
+    this.#discard();
     this.s = this.#fresh();
     this.downSince = null;
   }
@@ -283,7 +292,7 @@ export class Relay {
   async tick() {
     if (!this.enabled()) {
       this.downSince = null;
-      this.outbox = this.outbox.filter((n) => n.inflight);
+      this.#discard();
       return;
     }
     await this.#flush();
@@ -395,18 +404,22 @@ export class Relay {
     }
   }
 
-  /** A card's thread changed (inf:cards:thread). */
+  /**
+   * A card's thread changed (inf:cards:thread). Like every event, it is matched only against requests begun before it
+   * arrived (`arrivedAt`): a later one cannot have written it, however long it waits in the queue.
+   */
   onThread(thread) {
     const s = this.s;
+    const arrivedAt = Date.now();
     return this.#serial(async () => {
       if (!this.#alive(s)) return;
       // A card this connection has not been told of yet: kept, and read when the card arrives.
-      if (s.up && !s.known.has(thread?.cardId) && thread?.cardId !== undefined) return void s.early.set(thread.cardId, thread);
-      await this.#threadLines(s, thread);
+      if (s.up && !s.known.has(thread?.cardId) && thread?.cardId !== undefined) return void s.early.set(thread.cardId, [thread, arrivedAt]);
+      await this.#threadLines(s, thread, arrivedAt);
     });
   }
 
-  async #threadLines(s, thread) {
+  async #threadLines(s, thread, arrivedAt) {
     await this.cardsRun;
     await s.baseline.get(thread?.cardId);
     if (!this.enabled() || !this.#alive(s)) return;
@@ -420,15 +433,15 @@ export class Relay {
     const since = s.introduced.get(card.id) ?? 0;
     // A line stamped at or before the moment the card was first seen is history, however late it is pushed (equal: skipped).
     for (const m of messages.filter((x) => Number(x.id) > last && x.text && (x.at === undefined || x.at > since) && ["captain", "crewmate", "firstmate"].includes(x.who))) {
-      await this.#line(s, card, m);
+      await this.#line(s, card, m, arrivedAt);
     }
   }
 
-  async #line(s, card, m) {
+  async #line(s, card, m, arrivedAt) {
     const replies = (r) => r.subject.kind === "reply" && r.subject.cardId === card.id && r.subject.lifecycleId === card.lifecycleId;
     const id = Number(m.id);
     if (m.who === "captain") {
-      const recs = await this.#records(s, replies, (r) => r.state === "started" && r.outcome === undefined && r.until > Date.now());
+      const recs = await this.#records(s, (r) => replies(r) && r.at <= arrivedAt, (r) => r.state === "started" && r.outcome === undefined && r.until > Date.now());
       if (!recs || recs.some((r) => r.outcome === "accepted" && r.lineId === id)) return;
       const unclear = recs.find((r) => r.outcome !== "accepted" && r.outcome !== "refused" && r.subject.textFp === textPrint(m.text) && !hasMarker(r.path, "line") && claimMarker(r.path, "line"));
       return void (await this.#notify(`line:${card.id}:${id}`, unclear ? unclearNotice(unclear, `A comment under ${JSON.stringify(card.title)} (card ${card.id}) reads: ${m.text}\n`) : commentNotice(card, m)));
@@ -443,32 +456,34 @@ export class Relay {
     const event = payload?.type ? payload : payload?.event;
     if (!event) return Promise.resolve();
     const s = this.s;
+    const arrivedAt = Date.now();
     return this.#serial(async () => {
       if (!this.enabled() || !this.#alive(s)) return;
-      if (event.type === "user_turn") return this.#turn(s, event.text);
-      if (event.type === "firstmate_reply") return this.#firstMateReply(s, event.text);
+      if (event.type === "user_turn") return this.#turn(s, event.text, arrivedAt);
+      if (event.type === "firstmate_reply") return this.#firstMateReply(s, event.text, arrivedAt);
       if (["task_changed", "task_event"].includes(event.type) && s.merges.has(event.taskId)) await this.#merge(s, event.taskId);
     });
   }
 
-  /** A say's own turn can echo only if it began while this connection was up. */
-  #liveTurn = (s) => (r) => r.at >= s.connectedAt && Date.now() - r.at < 15 * 60 * 1000;
-  /** Its reply can echo if the say began on this connection, or was still running when it began, or finished since. */
-  #liveReply = (s) => (r) => (r.at >= s.connectedAt || r.doneAt >= s.connectedAt || (r.state === "started" && r.until > Date.now())) && Date.now() - r.at < 15 * 60 * 1000;
+  /** A say's own turn can echo only if it began while this connection was up, and before the turn arrived. */
+  #liveTurn = (s, arrivedAt) => (r) => r.at >= s.connectedAt && r.at <= arrivedAt && arrivedAt - r.at < 15 * 60 * 1000;
+  /** Its reply can echo if the say began before the reply arrived: on this connection, or still running when it began, or finished since. */
+  #liveReply = (s, arrivedAt) => (r) =>
+    (r.at >= s.connectedAt || r.doneAt >= s.connectedAt || (r.state === "started" && r.until > Date.now())) && r.at <= arrivedAt && arrivedAt - r.at < 15 * 60 * 1000;
 
-  async #turn(s, text) {
-    const live = this.#liveTurn(s);
+  async #turn(s, text, arrivedAt) {
+    const live = this.#liveTurn(s, arrivedAt);
     const say = (r) => r.subject.kind === "say" && r.subject.textFp === textPrint(text) && live(r) && !hasMarker(r.path, "turn");
     const recs = await this.#records(s, say, (r) => r.state === "started" && r.outcome === undefined && r.until > Date.now());
     if (!recs) return;
     const own = recs.find((r) => r.outcome === "accepted") ?? recs.find((r) => r.outcome === "unknown" || (r.state === "started" && r.outcome === undefined));
-    if (own && !claimMarker(own.path, "turn")) return this.#turn(s, text);
+    if (own && !claimMarker(own.path, "turn")) return this.#turn(s, text, arrivedAt);
     if (own?.outcome === "accepted") return;
     await this.#notify(`turn:${this.seq++}`, own ? unclearNotice(own, `The first mate was told: ${text}\n`) : turnNotice(text));
   }
 
-  async #firstMateReply(s, text) {
-    const live = this.#liveReply(s);
+  async #firstMateReply(s, text, arrivedAt) {
+    const live = this.#liveReply(s, arrivedAt);
     const say = (r) => r.subject.kind === "say" && live(r);
     const recs = await this.#records(s, say, (r) => r.state === "started" && r.until > Date.now());
     if (!recs) return;

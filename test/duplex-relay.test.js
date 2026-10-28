@@ -3,13 +3,17 @@
 // progress, the switch changing drops waiting notices, work from a replaced connection is dropped, and the outbox
 // evicts by identity.
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { mkdtempSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { claim, finish, textPrint, answersPrint } from "../src/requests.js";
+import { replyToCard, sayToFirstMate } from "../src/act.js";
+import { claim, finish, mark, textPrint, answersPrint } from "../src/requests.js";
 import { Relay } from "../src/relay.js";
 import { readJson, receiptsPath } from "../src/state.js";
+import { makeSender } from "../src/webhook.js";
 import { card } from "./standin.js";
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -487,4 +491,258 @@ test("R17: the same across a restart of the bridge instead of a reconnect", asyn
   const said = await acceptedAnswerToNewerOfferEnds(r, restarted, "answer-rej-restart");
   assert.deepEqual(said, [], "Grok bot's own accepted answer to the newest offer is not echoed");
   assert.equal(savedOnArrival?.offerId, "1-v2");
+});
+
+// R19 (review at 2e4768a): what the captain did reaches the queue before Grok bot's later command of the same words, so
+// only a request begun before the event arrived can be its origin. A message, a first-mate answer or a comment held behind
+// a running command used to take the later request's credit: the captain's words were hidden or attributed to the request,
+// and Grok bot's own echo was then reported as the captain's.
+const afterNow = async () => {
+  const t = Date.now();
+  while (Date.now() <= t) await wait(1);
+};
+
+test("R19: your message to the first mate held behind a running command is reported without waiting for Grok bot's later say of the same words, and that say's turn is still its own echo", async () => {
+  const r = rig();
+  await r.relay.onUp(r.reads);
+  const release = blockQueue(r, "hold-turn");
+  await wait(20);
+  r.relay.onEvent({ type: "user_turn", text: "ship it" }); // you, in Infinitary
+  await afterNow();
+  const say = claim(r.dir, "say-later-aa", "p-say-later-aa", { subject: { kind: "say", textFp: textPrint("ship it") }, holdMs: 60000 });
+  r.relay.onEvent({ type: "user_turn", text: "ship it" }); // Grok bot's say of the same words
+  release();
+  await until(() => r.sent.length === 1, 1000);
+  assert.match(r.sent[0], /you told the first mate: ship it/, "yours is reported while Grok bot's say is still running");
+  finish(say.path, { ok: true }, { outcome: "accepted", replyFp: textPrint("Done.") });
+  r.relay.onEvent({ type: "firstmate_reply", text: "Done." });
+  await r.relay.idle();
+  assert.equal(r.sent.length, 1, "Grok bot's own turn and the answer it printed are not echoed");
+});
+
+test("R19: when Grok bot's later say of the same words has an unclear outcome, your earlier message is still yours and only its own turn is reported as that request's result", async () => {
+  const r = rig();
+  await r.relay.onUp(r.reads);
+  const release = blockQueue(r, "hold-unclear");
+  await wait(20);
+  r.relay.onEvent({ type: "user_turn", text: "ship it" });
+  await afterNow();
+  const say = claim(r.dir, "say-later-bb", "p-say-later-bb", { subject: { kind: "say", textFp: textPrint("ship it") }, holdMs: 60000 });
+  mark(say.path, { outcome: "unknown" }); // its acceptance was not confirmed
+  r.relay.onEvent({ type: "user_turn", text: "ship it" });
+  release();
+  await r.relay.idle();
+  assert.equal(r.sent.length, 2);
+  assert.match(r.sent[0], /^In Infinitary · you told the first mate: ship it$/);
+  assert.match(r.sent[1], /^Request say-later-bb \(say\): its outcome is unclear\. The first mate was told: ship it/);
+});
+
+test("R19: the first mate's answer to you held behind a running command is reported without waiting for Grok bot's later say, and that say's own answer is not echoed", async () => {
+  const r = rig();
+  await r.relay.onUp(r.reads);
+  const release = blockQueue(r, "hold-answer");
+  await wait(20);
+  r.relay.onEvent({ type: "firstmate_reply", text: "Done." }); // the first mate answering you
+  await afterNow();
+  const say = claim(r.dir, "say-later-cc", "p-say-later-cc", { subject: { kind: "say", textFp: textPrint("go on") }, holdMs: 60000 });
+  release();
+  await until(() => r.sent.length === 1, 1000);
+  assert.match(r.sent[0], /the first mate answered: Done\./, "yours is reported while Grok bot's say is still running");
+  r.relay.onEvent({ type: "user_turn", text: "go on" });
+  finish(say.path, { ok: true }, { outcome: "accepted", replyFp: textPrint("Done.") });
+  r.relay.onEvent({ type: "firstmate_reply", text: "Done." }); // the same words, answering Grok bot
+  await r.relay.idle();
+  assert.equal(r.sent.length, 1, "Grok bot's say and the answer it printed are not echoed");
+});
+
+test("R19: your comment held behind a running command is yours even when Grok bot later replies the same words with an unclear outcome; only its own line is reported as that request's result", async () => {
+  const r = rig();
+  await r.relay.onUp(r.reads);
+  await r.relay.onCards([live()]);
+  await r.relay.idle();
+  const cardSent = r.sent.length;
+  const release = blockQueue(r, "hold-line");
+  await wait(20);
+  const yours = { id: 1, who: "captain", text: "looks good", cardId: "1", at: Date.now() + 60000 };
+  r.relay.onThread({ cardId: "1", messages: [yours] });
+  await afterNow();
+  const reply = claim(r.dir, "reply-later-aa", "p-reply-later-aa", { subject: { kind: "reply", cardId: "1", lifecycleId: "1-l1", offerId: "1-v1", textFp: textPrint("looks good") }, holdMs: 60000 });
+  mark(reply.path, { outcome: "unknown" }); // its send was not confirmed
+  const its = { id: 2, who: "captain", text: "looks good", cardId: "1", at: Date.now() + 60000 };
+  r.relay.onThread({ cardId: "1", messages: [yours, its] });
+  release();
+  await r.relay.idle();
+  const said = r.sent.slice(cardSent);
+  assert.equal(said.length, 2);
+  assert.match(said[0], /^In Infinitary · you commented under "Card 1" \(card 1\): looks good$/);
+  assert.match(said[1], /^Request reply-later-aa \(reply\): its outcome is unclear\. A comment under "Card 1" \(card 1\) reads: looks good/);
+});
+
+// R20 (review at 2e4768a): the hold a reply or say claims is the deadline the relay waits for, so the command must not
+// print anything it learns after it. Their holds used to cover only the wait plus 15 seconds, while the send alone may take
+// 20 and the confirming reads more, so an answer the relay had already passed on was printed again. Driven under fake time
+// with a link whose answers the test times: the command's own deadline is checked, not the link's 20-second timeout.
+function timedLink(answers) {
+  const link = new EventEmitter();
+  link.invoke = (channel) => {
+    const { ms = 0, value } = answers[channel] ?? {};
+    const answer = () => (typeof value === "function" ? value() : value);
+    return ms ? new Promise((resolve) => setTimeout(() => resolve(answer()), ms)) : Promise.resolve(answer());
+  };
+  return link;
+}
+const advance = async (t, ms, step = 50) => {
+  for (let gone = 0; gone < ms; gone += step) {
+    t.mock.timers.tick(step);
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+  }
+};
+
+for (const [label, replyMs, printedBy] of [["slower than the old hold", 18000, "command"], ["stalled past the command's whole deadline", 50000, "relay"]]) {
+  test(`R20: a reply whose send is ${label}: the crewmate's answer reaches Grok bot exactly once, printed or passed on, and its own line is not reported as yours`, async (t) => {
+    const r = rig();
+    await r.relay.onUp(r.reads);
+    await r.relay.onCards([live()]);
+    await r.relay.idle();
+    const before = r.sent.length;
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+    const text = "Please proceed.";
+    let lines = [];
+    const link = timedLink({
+      "inf:cards:list": { value: [live()] },
+      "inf:cards:thread": { value: () => ({ cardId: "1", messages: lines }) },
+      "inf:cards:reply": { ms: replyMs, value: () => ({ cardId: "1", messages: lines }) },
+    });
+    const run = replyToCard(link, r.dir, { cardId: "1", offerId: "1-v1", lifecycleId: "1-l1", requestId: "reply-slow-aa", text, waitMs: 0, pollMs: 20 }).then((v) => ({ v }), (e) => ({ e }));
+    await advance(t, 1000);
+    // Infinitary wrote Grok bot's line and the crewmate answered it while the reply's own result was still on its way.
+    lines = [{ id: 1, who: "captain", text, cardId: "1", at: Date.now() }, { id: 2, who: "crewmate", text: "On it.", cardId: "1", at: Date.now() }];
+    r.relay.onThread({ cardId: "1", messages: lines });
+    await advance(t, 70000);
+    const out = await run;
+    await r.relay.idle();
+    const said = r.sent.slice(before);
+    const printed = (out.v?.answers ?? []).filter((a) => a.text === "On it.").length;
+    const passedOn = said.filter((m) => /On it\./.test(m)).length;
+    assert.equal(printed + passedOn, 1, "printed by the command or passed on by the relay, not both");
+    if (printedBy === "command") assert.equal(printed, 1, "within its deadline the command prints it");
+    else assert.match(out.e?.message ?? "", /inf:cards:reply timed out/, "past its deadline the command gives up and the relay passes it on");
+    assert.ok(!said.some((m) => /you commented/.test(m)), "Grok bot's own line is not reported as yours");
+  });
+}
+
+for (const [label, converseMs, printedBy] of [["slower than the old hold", 19000, "command"], ["stalled past the command's whole deadline", 60000, "relay"]]) {
+  test(`R20: a say whose acceptance is ${label}: the first mate's answer reaches Grok bot exactly once, and its message is not reported as yours`, async (t) => {
+    const r = rig();
+    await r.relay.onUp(r.reads);
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+    const text = "Status?";
+    const link = timedLink({
+      "inf:conversation:state": { value: { busy: false } },
+      "inf:converse": { ms: converseMs, value: { ok: true } },
+      "inf:conversation:last-turn": { ms: 3000, value: { you: text, reply: { text: "All green." } } },
+    });
+    const run = sayToFirstMate(link, r.dir, { requestId: "say-slow-aa", text, waitMs: 5000, pollMs: 20 }).then((v) => ({ v }), (e) => ({ e }));
+    await advance(t, 1000);
+    // Infinitary took the message and the first mate answered while the converse result was still on its way.
+    for (const event of [{ type: "user_turn", text }, { type: "firstmate_reply", text: "All green." }]) {
+      link.emit("push", "inf:event", event);
+      r.relay.onEvent(event);
+    }
+    await advance(t, 80000);
+    const out = await run;
+    await r.relay.idle();
+    const printed = out.v?.reply?.text === "All green." ? 1 : 0;
+    assert.equal(printed + r.sent.filter((m) => /All green\./.test(m)).length, 1, "printed by the command or passed on by the relay, not both");
+    if (printedBy === "command") assert.equal(printed, 1, "within its deadline the command prints it");
+    else assert.match(out.e?.message ?? "", /acceptance was not confirmed/, "past its deadline the command gives up and the relay passes it on");
+    assert.ok(!r.sent.some((m) => /you told the first mate/.test(m)), "Grok bot's own message is not reported as yours");
+  });
+}
+
+// R21 (review at 2e4768a): a write of the switch drops what waits, and a notice already on its way keeps only the outcome
+// of the chunk being sent. One kept as in flight across the write used to stay queued when that chunk was then refused,
+// so the next tick or reconnect sent a notice from before the switch; and its later chunks were still sent.
+for (const [how, observe] of [
+  ["seen by a tick while its chunk is on its way", (r) => (r.epochValue += 1, r.relay.tick())],
+  ["the switch seen going off while its chunk is on its way", (r) => (r.epochValue += 1, r.relay.onOff())],
+]) {
+  test(`R21: a notice being sent when the switch is written (${how}) is not tried again after that chunk is refused`, async () => {
+    const r = rig();
+    await r.relay.onUp(r.reads);
+    const tries = [];
+    r.mode = (m) => (tries.push(m), tries.length === 1 ? { ok: false, status: 403, rejected: true } : (r.sent.push(m), { ok: true, status: 200 }));
+    r.gate = deferred();
+    const notice = r.relay.onEvent({ type: "user_turn", text: "said before the switch" });
+    await wait(20);
+    const seen = observe(r);
+    r.gate.resolve();
+    r.gate = null;
+    await notice;
+    await seen;
+    await r.relay.tick();
+    await r.relay.onUp(r.reads);
+    await r.relay.onEvent({ type: "user_turn", text: "said after the switch" });
+    assert.equal(tries.filter((m) => /said before/.test(m)).length, 1, "tried once, refused, then dropped with the switch");
+    assert.deepEqual(r.sent.map((m) => /said (before|after)/.exec(m)[1]), ["after"]);
+    assert.equal(r.relay.outbox.length, 0);
+  });
+}
+
+for (const [how, observe] of [
+  ["seen by a tick while its first chunk is on its way", (r) => r.relay.tick()],
+  ["first seen by the next chunk's own switch check", async () => {}],
+]) {
+  test(`R21: a multipart notice being sent when the switch is written (${how}) stops after the chunk already on its way`, async () => {
+    const r = rig({ maxChars: 40 });
+    await r.relay.onUp(r.reads);
+    r.gate = deferred();
+    const notice = r.relay.onEvent({ type: "user_turn", text: "word ".repeat(30) });
+    await wait(20);
+    r.epochValue += 1;
+    const seen = observe(r);
+    r.gate.resolve();
+    r.gate = null;
+    await notice;
+    await seen;
+    await r.relay.tick();
+    await r.relay.onUp(r.reads);
+    assert.equal(r.sent.length, 1, "the chunk on its way was delivered; the rest belongs to the time before the switch");
+    assert.match(r.sent[0], /^\(1\//);
+    assert.equal(r.relay.outbox.length, 0);
+  });
+}
+
+// R22 (review at 2e4768a): the captain's retry rule names a 5xx as a delivery that may have happened, never sent again.
+// Kept proof through the real webhook sender against a loopback endpoint, on the notice outbox itself.
+test("R22: a notice the webhook answers with a 5xx is not sent again by a later notice, a tick or a reconnect", async () => {
+  const bodies = [];
+  let status = 500;
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => (bodies.push(body), res.writeHead(status).end()));
+  });
+  await new Promise((ok) => server.listen(0, "127.0.0.1", ok));
+  try {
+    const dir = mkdtempSync(join(tmpdir(), "gb-relay5xx-"));
+    const settings = join(dir, "webhook.env");
+    writeFileSync(settings, `GROKBOT_WEBHOOK_URL=http://127.0.0.1:${server.address().port}/hook\nGROKBOT_WEBHOOK_AUTH=test-key\n`, { mode: 0o600 });
+    const reads = { thread: async () => ({ messages: [] }), past: async () => null, task: async () => null };
+    const relay = new Relay({ dir, send: makeSender(settings), enabled: () => true, epoch: () => 0, pollMs: 5, reads });
+    await relay.onUp(reads);
+    await relay.onEvent({ type: "user_turn", text: "first words" }); // answered 500
+    status = 200;
+    await relay.onEvent({ type: "user_turn", text: "second words" });
+    await relay.tick();
+    relay.onDown();
+    await relay.onUp(reads);
+    await relay.tick();
+    assert.deepEqual(bodies.map((b) => /(first|second) words/.exec(b)[1]), ["first", "second"], "the 5xx notice was tried once");
+    assert.equal(relay.outbox.length, 0);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
 });

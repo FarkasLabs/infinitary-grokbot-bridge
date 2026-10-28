@@ -6,6 +6,26 @@ const IDENT = /^[A-Za-z0-9_.:-]{1,64}$/;
 export const MAX_REPLY = 4000;
 export const MAX_SAY = 20000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/** How long one request may take on the link (HomeLink's own timeout), for sizing a command's deadline. */
+const REQUEST_MS = 20000;
+/** Kept between a command's last step and its deadline, to write the outcome. */
+const GRACE_MS = 2000;
+/** The hold a command claims: `steps` requests on the link after the claim, its wait, and the grace. */
+const holdFor = (steps, waitMs = 0) => steps * REQUEST_MS + waitMs + GRACE_MS;
+
+/**
+ * Requests after a claim, cut off before the record's deadline (`until`). The relay waits for a running command exactly
+ * until then and then decides on what the record says, so a command never learns, confirms or prints anything later.
+ */
+function bounded(link, until) {
+  const stop = until - GRACE_MS;
+  const call = (channel, args) => {
+    let timer;
+    const late = new Promise((_, reject) => (timer = setTimeout(() => reject(new Error(`${channel} timed out.`)), Math.max(0, stop - Date.now()))));
+    return Promise.race([link.invoke(channel, args), late]).finally(() => clearTimeout(timer));
+  };
+  return { stop, call };
+}
 
 /** What pressing a button does, in words, and whether it needs --confirm. */
 export function effectOf(action) {
@@ -50,13 +70,15 @@ export async function answerCard(link, dir, opts) {
   }
   const checked = checkAnswers(card, answers);
 
-  const acquired = claim(dir, requestId, print, { subject: { kind: "answer", cardId, lifecycleId, offerId, actionId, answersFp: answersPrint(checked) } });
+  // The press, then the list and the ending that confirm it.
+  const acquired = claim(dir, requestId, print, { subject: { kind: "answer", cardId, lifecycleId, offerId, actionId, answersFp: answersPrint(checked) }, holdMs: holdFor(3) });
   if (!acquired.fresh) return { ...acquired.result, replayed: true };
   const { path } = acquired;
+  const { call } = bounded(link, acquired.until);
   const submission = { id: requestId, lifecycleId, offerId, reading: "none" };
   let reply;
   try {
-    reply = await link.invoke("inf:cards:act", [cardId, actionId, "chrome", checked.length ? { answers: checked } : null, submission]);
+    reply = await call("inf:cards:act", [cardId, actionId, "chrome", checked.length ? { answers: checked } : null, submission]);
   } catch (e) {
     mark(path, { outcome: "unknown" });
     throw e;
@@ -65,7 +87,7 @@ export async function answerCard(link, dir, opts) {
   if (reply?.refusal) result = { ok: false, refusal: String(reply.refusal), label: action.label };
   else {
     // Infinitary answers {} to a press on a card it no longer shows, so the press is confirmed by how the card ended.
-    result = await confirmPress(link, card, action, checked);
+    result = await confirmPress(call, card, action, checked);
     result.label = action.label;
     result.kind = effect.kind;
   }
@@ -73,12 +95,12 @@ export async function answerCard(link, dir, opts) {
   return result;
 }
 
-async function confirmPress(link, card, action, checked) {
-  const still = (await link.invoke("inf:cards:list", [])).find((c) => c.id === card.id && c.lifecycleId === card.lifecycleId);
+async function confirmPress(call, card, action, checked) {
+  const still = (await call("inf:cards:list", [])).find((c) => c.id === card.id && c.lifecycleId === card.lifecycleId);
   if (still) return { ok: false, refusal: "Infinitary still shows the card, so it did not take the press." };
   let past;
   try {
-    past = await link.invoke("inf:cards:past", [card.id]);
+    past = await call("inf:cards:past", [card.id]);
   } catch {}
   const end = past?.ending;
   if (!end) return { ok: false, unclear: true, refusal: "Infinitary did not confirm how the card ended. The press may or may not have counted; read the card before deciding what to do next." };
@@ -107,13 +129,15 @@ export async function ackNote(link, dir, opts) {
   if (card.requiredActions?.length) throw new Error(`Note ${cardId} lists required actions. Close it in Infinitary itself.`);
   if (!onStage(card)) throw new Error(`Note ${cardId} is still with its author (${card.awaiting}). Acknowledge it once Infinitary shows it.`);
 
-  const acquired = claim(dir, requestId, print, { subject: { kind: "ack", cardId, lifecycleId, offerId } });
+  // The close, then the list that confirms it.
+  const acquired = claim(dir, requestId, print, { subject: { kind: "ack", cardId, lifecycleId, offerId }, holdMs: holdFor(2) });
   if (!acquired.fresh) return { ...acquired.result, replayed: true };
   const { path } = acquired;
+  const { call } = bounded(link, acquired.until);
   let result;
   try {
-    await link.invoke("inf:cards:close", [cardId, { id: requestId, lifecycleId, offerId }]);
-    const after = (await link.invoke("inf:cards:list", [])).find((c) => c.id === cardId && c.lifecycleId === lifecycleId);
+    await call("inf:cards:close", [cardId, { id: requestId, lifecycleId, offerId }]);
+    const after = (await call("inf:cards:list", [])).find((c) => c.id === cardId && c.lifecycleId === lifecycleId);
     result = after ? { ok: false, refusal: "Infinitary still shows the note." } : { ok: true, title: card.title };
   } catch (e) {
     mark(path, { outcome: "unknown" });
@@ -138,13 +162,15 @@ export async function replyToCard(link, dir, opts) {
   currentCard(await link.invoke("inf:cards:list", []), opts);
   const before = (await link.invoke("inf:cards:thread", [cardId]))?.messages ?? [];
   const baseline = newest(before);
-  const acquired = claim(dir, requestId, print, { subject: { kind: "reply", cardId, lifecycleId, offerId, textFp: textPrint(text) }, holdMs: waitMs + 15000 });
+  // The reply, the wait, and the last read of the thread that may start as the wait ends.
+  const acquired = claim(dir, requestId, print, { subject: { kind: "reply", cardId, lifecycleId, offerId, textFp: textPrint(text) }, holdMs: holdFor(2, waitMs) });
   if (!acquired.fresh) return { ...acquired.result, replayed: true };
   const { path } = acquired;
+  const { stop, call } = bounded(link, acquired.until);
   const submission = { id: requestId, lifecycleId, offerId, reading: "none" };
   let thread;
   try {
-    thread = await link.invoke("inf:cards:reply", [cardId, { text }, submission]);
+    thread = await call("inf:cards:reply", [cardId, { text }, submission]);
   } catch (e) {
     mark(path, { outcome: "unknown" });
     throw e;
@@ -164,10 +190,10 @@ export async function replyToCard(link, dir, opts) {
     }
   };
   collect(thread?.messages ?? []);
-  const end = Date.now() + waitMs;
+  const end = Math.min(Date.now() + waitMs, stop);
   while (Date.now() < end && !answers.length) {
-    await sleep(pollMs);
-    const now = (await link.invoke("inf:cards:thread", [cardId]))?.messages ?? [];
+    await sleep(Math.min(pollMs, Math.max(0, end - Date.now())));
+    const now = (await call("inf:cards:thread", [cardId]))?.messages ?? [];
     collect(now);
   }
   const result = { ok: true, answers };
@@ -201,18 +227,20 @@ export async function sayToFirstMate(link, dir, opts) {
       throw new Error("A conversation message arrived while checking the first mate. Nothing was sent; retry when the conversation is idle.");
     }
 
-    const acquired = claim(dir, requestId, print, { subject: { kind: "say", textFp: textPrint(text) }, holdMs: waitMs + 15000 });
+    // The message, the wait, and the confirming reads that may start as the wait ends.
+    const acquired = claim(dir, requestId, print, { subject: { kind: "say", textFp: textPrint(text) }, holdMs: holdFor(2, waitMs) });
     if (!acquired.fresh) return { ...acquired.result, replayed: true };
     const { path } = acquired;
+    const { stop, call } = bounded(link, acquired.until);
     open = path;
     try {
-      await link.invoke("inf:converse", [{ text }]);
+      await call("inf:converse", [{ text }]);
     } catch {
       mark(path, { outcome: "unknown" });
       throw new Error("The first mate's acceptance was not confirmed. The message may have been sent; read 'last' before deciding what to do next.");
     }
 
-    const end = Date.now() + waitMs;
+    const end = Math.min(Date.now() + waitMs, stop);
     let ownTurnIndex = -1;
     while (Date.now() < end) {
       const userTurns = seen.map((event, index) => ({ event, index })).filter(({ event }) => event.type === "user_turn");
@@ -224,8 +252,8 @@ export async function sayToFirstMate(link, dir, opts) {
         const replyEvent = seen.find((event, index) => index > ownTurnIndex && event.type === "firstmate_reply");
         if (replyEvent) {
           const [turn, state] = await Promise.all([
-            link.invoke("inf:conversation:last-turn", []),
-            link.invoke("inf:conversation:state", []),
+            call("inf:conversation:last-turn", []),
+            call("inf:conversation:state", []),
           ]);
           if (seen.filter((event) => event.type === "user_turn").length !== 1) {
             throw new Error("Another conversation message overlapped this request. Its answer is ambiguous; read 'last' before sending anything else.");
