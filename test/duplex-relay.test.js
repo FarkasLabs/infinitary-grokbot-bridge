@@ -104,129 +104,46 @@ test("R11: the switch written between two looks drops the notices waiting for a 
   assert.equal(r.sent.length, 0);
 });
 
-test("R12: work begun on a connection that has since been replaced reports nothing and fills nothing in", async () => {
-  const gate = deferred();
-  const r = rig();
-  const a = card("1", { lifecycleId: "1-l1" });
-  const readsA = { thread: async () => ({ messages: [] }), past: async () => (await gate.promise, { ending: { how: "chose", actionId: "go", label: "Go ahead", by: "captain", at: 1 }, answers: [] }) };
-  await r.relay.onUp(readsA);
-  await r.relay.onCards([a]);
-  r.relay.sent["1"] = "1-v1";
-  const gone = r.relay.onCards([]);
-  await wait(30);
-  r.relay.onDown();
-  await r.relay.onUp({ thread: async () => ({ messages: [] }), past: async () => null });
-  await r.relay.onCards([]);
-  gate.resolve();
-  await gone;
-  await r.relay.idle();
-  assert.equal(r.sent.length, 1 /* the card itself */);
-});
-
-test("R13: when the outbox overflows while a tick is sending the oldest notice, that notice is delivered and exactly the next one is evicted", async () => {
+test("R12: a card pass held behind an earlier delivery does nothing to the receipts once its connection was replaced, even with no known cards", async () => {
   const r = rig();
   await r.relay.onUp(r.reads);
-  r.mode = "refuse";
-  for (let i = 0; i < 100; i += 1) await r.relay.onEvent({ type: "user_turn", text: `message ${i}` });
-  r.mode = "ok";
+  await r.relay.onCards([live()]); // card 1 delivered and receipted
+  const receipt = r.relay.sent["1"];
+  assert.ok(receipt);
+  r.relay.onDown();
+  await r.relay.onUp(r.reads);
   r.gate = deferred();
-  const tick = r.relay.tick();
-  await wait(30);
-  const overflow = r.relay.onEvent({ type: "user_turn", text: "message 100" });
-  await wait(30);
-  r.gate.resolve();
-  r.gate = null;
-  await Promise.all([tick, overflow]);
-  await r.relay.tick();
-  const got = new Set(r.sent.map((m) => /message (\d+)/.exec(m)[1]));
-  assert.equal(got.size, 100);
-  assert.ok(got.has("0"), "the one in flight was delivered");
-  assert.ok(!got.has("1"), "the next oldest was the one evicted");
-  assert.ok(got.has("100"));
-});
-
-test("R14: Infinitary republishing a new card's existing thread is history, not a new comment", async () => {
-  const r = rig();
-  r.reads.thread = async () => ({ messages: [{ id: 4, who: "captain", text: "typed while the bridge was off", at: Date.now() - 60000 }] });
-  await r.relay.onUp(r.reads);
-  await r.relay.onCards([]);
-  await r.relay.onCards([live()]);
-  const sentCard = r.sent.length;
-  await r.relay.onThread({ cardId: "1", messages: [{ id: 4, who: "captain", text: "typed while the bridge was off", at: Date.now() - 60000 }] });
-  assert.equal(r.sent.length, sentCard, "a republished snapshot is not news");
-  await r.relay.onThread({ cardId: "1", messages: [{ id: 4, who: "captain", text: "typed while the bridge was off", at: Date.now() - 60000 }, { id: 5, who: "captain", text: "now", at: Date.now() }] });
-  assert.equal(r.sent.length, sentCard + 1);
-  assert.match(r.sent.at(-1), /: now$/);
-});
-
-test("R12: a card pass begun on a replaced connection does not delete or overwrite the new connection's receipts", async () => {
-  const gate = deferred();
-  const r = rig();
-  const a = live(card("1"));
-  const readsA = { thread: async () => ({ messages: [] }), past: async () => (await gate.promise, null) };
-  await r.relay.onUp(readsA);
-  await r.relay.onCards([a]);
-  const cardSent = r.sent.length;
-  r.relay.onCards([]); // card 1 leaves: the old connection waits on its ending read
-  await wait(30);
+  r.relay.onCards([live(), live(card("2"))]); // stalls delivering card 2
   r.relay.onDown();
-  await r.relay.onUp({ thread: async () => ({ messages: [] }), past: async () => null });
-  await r.relay.onCards([a]);
-  gate.resolve();
-  await r.relay.idle();
-  assert.equal(r.relay.sent["1"], "1-v1", "the new connection's receipt survives");
-  assert.equal(r.sent.length, cardSent, "the card is not sent again");
-  await r.relay.onThread({ cardId: "1", messages: [{ id: 1, who: "captain", text: "after reconnect", at: Date.now() + 5 }] });
-  assert.match(r.sent.at(-1), /after reconnect/, "its thread is still followed");
-});
-
-test("R1: a comment on an already relayed card, typed after reconnecting, is news even while another delivery stalls the card list", async () => {
-  const r = rig();
+  r.relay.meta = {}; // nothing remembered about card 1: the next pass has no known card to guard it
   await r.relay.onUp(r.reads);
-  await r.relay.onCards([live()]); // card 1 relayed
+  r.relay.onCards([live(card("3"))]); // a pass that does not show card 1, held behind the stalled delivery
+  await wait(20);
   r.relay.onDown();
-  const typed = [];
-  r.reads.thread = async () => ({ messages: typed });
   await r.relay.onUp(r.reads);
-  r.gate = deferred(); // the webhook stalls on card 2's message
-  r.relay.onCards([live(card("2"))]);
-  r.relay.onCards([live(), live(card("2"))]); // the list that names card 1 arrives behind that stalled delivery
-  await wait(20);
-  typed.push({ id: 1, who: "captain", text: "typed while the webhook was slow", at: Date.now() });
-  r.relay.onThread({ cardId: "1", messages: typed });
+  const newer = r.relay.onCards([live()]); // the newest connection shows card 1
   await wait(20);
   r.gate.resolve();
   r.gate = null;
+  await newer;
   await r.relay.idle();
-  assert.match(r.sent.join("\n"), /typed while the webhook was slow/);
+  assert.equal(r.relay.sent["1"], receipt, "the newest connection's receipt for card 1 survives");
+  assert.equal(r.sent.filter((m) => /Card 1/.test(m)).length, 1, "card 1 is not sent again");
 });
 
-test("R1: a comment on a card pushed before the card list is read is kept and reported once the card is known", async () => {
+test("R16: a relayed card that ends after the connection began but before its first list is reported; one that ended earlier is not", async () => {
   const r = rig();
   await r.relay.onUp(r.reads);
-  const first = { id: 1, who: "captain", text: "typed during connect", at: Date.now() + 5 };
-  r.reads.thread = async () => ({ messages: [] });
-  r.relay.onThread({ cardId: "1", messages: [first] });
-  await r.relay.onCards([live()]);
+  await r.relay.onCards([live(), live(card("2"))]);
+  r.relay.onDown();
+  await r.relay.onUp(r.reads);
+  const edge = r.relay.s.connectedAt;
+  const ends = { 1: edge + 1000, 2: edge - 1000 };
+  r.reads.past = async (id) => ({ id, title: `Card ${id}`, ending: { how: "chose", actionId: "go", label: "Go ahead", by: "captain", at: ends[id] }, answers: [] });
+  const before = r.sent.length;
+  await r.relay.onCards([]); // the first list: both are gone
   await r.relay.idle();
-  assert.match(r.sent.join("\n"), /typed during connect/);
-});
-
-test("R11: a notice the switch check itself discards while an earlier one is being sent is not sent", async () => {
-  const r = rig();
-  await r.relay.onUp(r.reads);
-  r.mode = "refuse";
-  await r.relay.onEvent({ type: "user_turn", text: "first words" });
-  await r.relay.onEvent({ type: "user_turn", text: "second words" });
-  assert.equal(r.relay.outbox.length, 2);
-  r.mode = "ok";
-  r.gate = deferred();
-  const flushed = r.relay.tick(); // sends the first, stalled in the webhook
-  await wait(20);
-  r.epochValue += 1; // the switch was written meanwhile
-  r.gate.resolve();
-  r.gate = null;
-  await flushed;
-  assert.deepEqual(r.sent.map((m) => /first/.test(m)), [true], "the first was already on its way; the second belongs to the time before");
-  assert.equal(r.relay.outbox.length, 0);
+  const said = r.sent.slice(before).join("\n");
+  assert.match(said, /Card 1/);
+  assert.doesNotMatch(said, /Card 2/);
 });

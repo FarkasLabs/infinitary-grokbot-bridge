@@ -372,7 +372,6 @@ test("only while connected: what happened while cut off is not sent after reconn
     await until(() => !r.daemon.link);
     r.home.state.endCard("8", { how: "chose", actionId: "go", by: "captain" });
     r.home.state.addLine("10", "captain", "typed while away");
-    await wait(5); // a line written in the very millisecond the connection begins cannot be told from one written just after it
     r.home.release();
     await until(() => r.daemon.link, 8000);
     await r.quiet();

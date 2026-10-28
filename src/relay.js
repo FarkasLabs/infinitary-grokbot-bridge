@@ -30,6 +30,7 @@ export class Relay {
     this.log = log;
     const saved = readJson(receiptsPath(dir), {});
     this.sent = saved.sent ?? {};
+    this.meta = saved.meta ?? {};
     this.noticeSent = saved.noticeSent ?? false;
     this.ended = saved.ended ?? [];
     this.reads = reads;
@@ -79,8 +80,13 @@ export class Relay {
     return this.work;
   }
 
+  /** What an ending needs to know about a card Grok bot was told of, kept so a restart or reconnect still recognises it. */
+  #remember(card) {
+    this.meta[card.id] = { id: card.id, title: card.title, lifecycleId: card.lifecycleId, offerId: card.offerId, taskId: card.taskId, actions: card.actions };
+  }
+
   #save() {
-    writePrivate(receiptsPath(this.dir), JSON.stringify({ sent: this.sent, noticeSent: this.noticeSent, ended: this.ended.slice(-200) }));
+    writePrivate(receiptsPath(this.dir), JSON.stringify({ sent: this.sent, meta: this.meta, noticeSent: this.noticeSent, ended: this.ended.slice(-200) }));
   }
 
   /** One chunk. "sent", "rejected" (definitely refused: a settings problem or a 4xx answer), "unknown" (may have been delivered) or "off". */
@@ -182,12 +188,16 @@ export class Relay {
       s.introduced.set(c.id, first ? Math.min(arrivedAt, s.connectedAt) : arrivedAt);
       s.baseline.set(c.id, this.#baseline(s, c.id, first ? undefined : 0));
     }
+    // Cards told of before this connection and not in its first list may have ended since it began: known again, but only
+    // an ending after the connection began is reported (the earlier ones are not caught up).
+    if (first) for (const id of Object.keys(this.sent)) if (!s.known.has(id) && this.meta[id]) s.known.set(id, { ...this.meta[id], restored: true });
     // Card state changes in the same order as thread and event handling, so a queued update still finds its card.
     this.#serial(async () => {
       if (!this.#alive(s)) return;
       const gone = [...s.known.keys()].filter((id) => !live.has(id));
       // An ending is decided on what was delivered, so it waits for the deliveries before this snapshot.
       if (gone.length || Object.keys(this.sent).some((id) => !live.has(id))) await prior.catch(() => {});
+      if (!this.#alive(s)) return;
       for (const id of gone) {
         const was = s.known.get(id);
         s.known.delete(id);
@@ -196,8 +206,9 @@ export class Relay {
         s.lastLine.delete(id);
         s.early.delete(id);
       }
+      if (!this.#alive(s)) return;
       for (const c of cards) s.known.set(c.id, c);
-      for (const id of Object.keys(this.sent)) if (!live.has(id)) delete this.sent[id];
+      for (const id of Object.keys(this.sent)) if (!live.has(id)) (delete this.sent[id], delete this.meta[id]);
       this.#save();
       for (const c of cards) {
         const early = s.early.get(c.id);
@@ -212,7 +223,7 @@ export class Relay {
     if (!this.enabled()) return;
     const ready = cards.filter((c) => c.status !== "streaming");
     const live = new Set(cards.map((c) => c.id));
-    if (!s.up) for (const id of Object.keys(this.sent)) if (!live.has(id)) delete this.sent[id];
+    if (!s.up) for (const id of Object.keys(this.sent)) if (!live.has(id)) (delete this.sent[id], delete this.meta[id]);
     const due = ready
       .filter((c) => this.sent[c.id] !== versionOf(c))
       .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
@@ -220,12 +231,12 @@ export class Relay {
     const rest = due.slice(0, due.length - shown.length);
     for (const card of shown) {
       const updated = card.id in this.sent;
-      if (await this.#emit(cardMessage(card, { updated }))) this.sent[card.id] = versionOf(card);
+      if (await this.#emit(cardMessage(card, { updated }))) (this.sent[card.id] = versionOf(card), this.#remember(card));
     }
     if (rest.length) {
       const lines = rest.map((c) => `- ${c.title} (card ${c.id})`);
       const ok = await this.#emit(`${rest.length} more card${rest.length === 1 ? "" : "s"} not sent in full:\n${lines.join("\n")}\nAsk for any of them by id.`);
-      if (ok) for (const c of rest) this.sent[c.id] = versionOf(c);
+      if (ok) for (const c of rest) (this.sent[c.id] = versionOf(c), this.#remember(c));
     }
     this.#save();
   }
@@ -277,15 +288,15 @@ export class Relay {
   // --- What happened in Infinitary itself, while connected. ---
 
   /**
-   * Where a new card's thread stands, read the moment the card is seen: lines written before then are history, however
-   * often Infinitary publishes them again; a line written since is news. Message ids ascend with their time.
+   * Where a new card's thread stands, read the moment the card is seen: lines written before then, or at that very instant (the
+   * captain's choice: an equal timestamp is skipped), are history, however often Infinitary publishes them again; a line written after is news. Message ids ascend with their time.
    */
   async #baseline(s, id, fallback) {
     const since = s.introduced.get(id) ?? Date.now();
     let at;
     try {
       const thread = await s.reads.thread?.(id);
-      at = (thread?.messages ?? []).filter((m) => (m.at ?? 0) < since).reduce((m, x) => Math.max(m, Number(x.id) || 0), 0);
+      at = (thread?.messages ?? []).filter((m) => (m.at ?? 0) <= since).reduce((m, x) => Math.max(m, Number(x.id) || 0), 0);
     } catch (e) {
       this.log(`thread read: ${e.message}`);
       at = fallback;
@@ -312,6 +323,7 @@ export class Relay {
     const past = await s.reads.past?.(card.id).catch((e) => (this.log(`past read: ${e.message}`), null));
     const e = past?.ending;
     if (!this.#alive(s) || !e || !["chose", "dismissed"].includes(e.how) || (e.by && e.by !== "captain")) return;
+    if (card.restored && !((e.at ?? 0) >= s.connectedAt)) return; // it ended before this connection: not caught up
     const ours = (r) => r.subject.cardId === card.id && r.subject.lifecycleId === card.lifecycleId && r.subject.offerId === card.offerId;
     const open = (r) => r.state === "started" && r.outcome === undefined && r.until > Date.now();
     let silent = false;
