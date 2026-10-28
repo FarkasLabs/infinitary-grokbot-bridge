@@ -69,7 +69,7 @@ export class Relay {
    * the session it was received in and does nothing once another has replaced it, so nothing carries over a reset.
    */
   #fresh(up = false, reads = this.reads) {
-    return { up, reads, known: new Map(), lastLine: new Map(), seen: new Set(), introduced: new Map(), baseline: new Map(), merges: new Map(), baselined: false, early: new Map(), connectedAt: up ? Date.now() : Infinity };
+    return { up, reads, known: new Map(), lastLine: new Map(), seen: new Set(), introduced: new Map(), baseline: new Map(), merges: new Map(), baselined: false, early: new Map(), arrived: new Map(), connectedAt: up ? Date.now() : Infinity };
   }
 
   #alive = (s) => this.s === s && s.up;
@@ -233,7 +233,7 @@ export class Relay {
         const early = s.early.get(c.id);
         if (!early) continue;
         s.early.delete(c.id);
-        await this.#threadLines(s, ...early);
+        await this.#threadLines(s, early);
       }
     });
   }
@@ -405,21 +405,27 @@ export class Relay {
   }
 
   /**
-   * A card's thread changed (inf:cards:thread). Like every event, it is matched only against requests begun before it
-   * arrived (`arrivedAt`): a later one cannot have written it, however long it waits in the queue.
+   * A card's thread changed (inf:cards:thread). Like every event, a line is matched only against requests begun before it
+   * arrived: a later one cannot have written it, however long it waits. Infinitary publishes the whole thread each time, so
+   * each line keeps the moment it first arrived (`s.arrived`), whichever later snapshot it is finally read from.
    */
   onThread(thread) {
     const s = this.s;
-    const arrivedAt = Date.now();
+    if (thread?.cardId !== undefined) {
+      const now = Date.now();
+      const first = s.arrived.get(thread.cardId) ?? new Map();
+      s.arrived.set(thread.cardId, first);
+      for (const m of thread.messages ?? []) if (!first.has(Number(m.id))) first.set(Number(m.id), now);
+    }
     return this.#serial(async () => {
       if (!this.#alive(s)) return;
       // A card this connection has not been told of yet: kept, and read when the card arrives.
-      if (s.up && !s.known.has(thread?.cardId) && thread?.cardId !== undefined) return void s.early.set(thread.cardId, [thread, arrivedAt]);
-      await this.#threadLines(s, thread, arrivedAt);
+      if (s.up && !s.known.has(thread?.cardId) && thread?.cardId !== undefined) return void s.early.set(thread.cardId, thread);
+      await this.#threadLines(s, thread);
     });
   }
 
-  async #threadLines(s, thread, arrivedAt) {
+  async #threadLines(s, thread) {
     await this.cardsRun;
     await s.baseline.get(thread?.cardId);
     if (!this.enabled() || !this.#alive(s)) return;
@@ -428,12 +434,16 @@ export class Relay {
     const messages = [...(thread.messages ?? [])].sort((a, b) => Number(a.id) - Number(b.id));
     const newest = messages.reduce((m, x) => Math.max(m, Number(x.id) || 0), 0);
     const last = s.lastLine.get(card.id);
-    s.lastLine.set(card.id, Math.max(newest, last ?? 0));
+    const upTo = Math.max(newest, last ?? 0);
+    s.lastLine.set(card.id, upTo);
+    // The lines read now keep the moments they first arrived; no line at or below the newest is read again, so those go.
+    const first = new Map(s.arrived.get(card.id));
+    for (const id of first.keys()) if (id <= upTo) s.arrived.get(card.id).delete(id);
     if (last === undefined) return;
     const since = s.introduced.get(card.id) ?? 0;
     // A line stamped at or before the moment the card was first seen is history, however late it is pushed (equal: skipped).
     for (const m of messages.filter((x) => Number(x.id) > last && x.text && (x.at === undefined || x.at > since) && ["captain", "crewmate", "firstmate"].includes(x.who))) {
-      await this.#line(s, card, m, arrivedAt);
+      await this.#line(s, card, m, first.get(Number(m.id)) ?? Date.now());
     }
   }
 

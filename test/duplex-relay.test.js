@@ -747,3 +747,49 @@ test("R22: a notice the webhook answers with a 5xx is not sent again by a later 
     server.close();
   }
 });
+
+// R19 (re-review at 3d74eb5): a line's boundary is the moment it first arrived, not the moment a later snapshot that still
+// carries it arrived. Infinitary publishes the whole thread each time, so a comment first seen before the card list (or
+// while the card's delivery was refused) was matched with the arrival of the next snapshot, and a reply Grok bot started in
+// between, with the same words and an unclear outcome, took the comment's credit and had its own line reported as yours.
+async function yoursThenItsReply(r, label) {
+  const yours = { id: 1, who: "captain", text: "looks good", cardId: "1", at: Date.now() + 60000 };
+  r.relay.onThread({ cardId: "1", messages: [yours] }); // you comment
+  await afterNow();
+  const reply = claim(r.dir, label, `p-${label}`, { subject: { kind: "reply", cardId: "1", lifecycleId: "1-l1", offerId: "1-v1", textFp: textPrint("looks good") }, holdMs: 60000 });
+  mark(reply.path, { outcome: "unknown" }); // then Grok bot replies the same words; its send was not confirmed
+  const its = { id: 2, who: "captain", text: "looks good", cardId: "1", at: Date.now() + 60000 };
+  r.relay.onThread({ cardId: "1", messages: [yours, its] }); // the next snapshot carries both lines
+  return [yours, its];
+}
+const yoursThenUnclear = (said, label) => {
+  assert.equal(said.length, 2);
+  assert.match(said[0], /^In Infinitary · you commented under "Card 1" \(card 1\): looks good$/);
+  assert.match(said[1], new RegExp(`^Request ${label} \\(reply\\): its outcome is unclear\\. A comment under "Card 1" \\(card 1\\) reads: looks good`));
+};
+
+test("R19: two snapshots of a thread before the first card list, separated by Grok bot's unclear reply of the same words: your comment keeps its first arrival and stays yours", async () => {
+  const r = rig();
+  await r.relay.onUp(r.reads);
+  await yoursThenItsReply(r, "reply-early-aa"); // both kept until the card is known
+  await r.relay.onCards([live()]);
+  await r.relay.idle();
+  const said = r.sent.filter((m) => !/Body of 1/.test(m));
+  yoursThenUnclear(said, "reply-early-aa");
+  assert.equal(r.relay.s.arrived.get("1")?.size ?? 0, 0, "nothing is kept for lines already read");
+});
+
+test("R19: the same when the snapshots arrive while the card's delivery is refused, and Infinitary publishes the thread again once it is delivered", async () => {
+  const r = rig();
+  await r.relay.onUp(r.reads);
+  r.mode = "refuse";
+  await r.relay.onCards([live()]); // known, its delivery refused
+  const lines = await yoursThenItsReply(r, "reply-early-bb");
+  await r.relay.idle();
+  r.mode = "ok";
+  await r.relay.onCards([live()]); // delivered now
+  const before = r.sent.length;
+  await r.relay.onThread({ cardId: "1", messages: lines }); // the same thread, published again
+  await r.relay.idle();
+  yoursThenUnclear(r.sent.slice(before), "reply-early-bb");
+});
