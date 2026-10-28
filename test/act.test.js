@@ -285,3 +285,97 @@ test("a required textarea preserves its initial answer and unchanged submissions
     { name: "notes", values: ["Existing notes"], changed: false },
   ]);
 });
+
+// Intent: the captain's request (GRBP-8, as changed to an explicit Acknowledge / Remind me later choice) to acknowledge a relayed note from Grok Bot with an 'ack' command
+// that keeps the offer/lifecycle checks, fails closed on stale or repeated requests, and never acts by itself.
+const note = card("21", { actions: [] });
+const required = [{ id: "x", target: "t", title: "Do it", consequence: "c", instructions: ["i"], criterion: "k", prerequisites: [], completion: { kind: "manual", label: "done" } }];
+
+test("ack closes the exact note with the app's own submission, once, and a replay or different content does not repeat it", async () => {
+  const { home, run, lines } = await setup([note]);
+  try {
+    const args = ["ack", "21", ...ids(note), "--request", "ack-21-v1aa"];
+    await run(args);
+    assert.match(lines.at(-1), /^Acknowledged note 21; Infinitary closed it\./);
+    assert.equal(home.state.hellos.at(-1).protocolVersion, "12.0.0", "the acting link speaks the home's own major");
+    assert.deepEqual(home.state.changes, [{ channel: "inf:cards:close", args: ["21", { id: "ack-21-v1aa", lifecycleId: "21-l1", offerId: "21-v1" }] }]);
+    await run(args);
+    assert.match(lines.at(-1), /^Already done: Acknowledged/);
+    await assert.rejects(run(["ack", "21", "--offer", "21-v2", "--lifecycle", "21-l1", "--request", "ack-21-v1aa"]), /different request/);
+    assert.equal(home.state.changes.length, 1);
+  } finally {
+    await home.close();
+  }
+});
+
+test("ack sends nothing for anything but a ready note on the stage with no buttons and no required actions", async () => {
+  const cases = {
+    decision: card("22"),
+    attention: card("23", { author: "host", actions: [{ id: "deny", label: "Deny" }] }),
+    required: card("24", { actions: [], requiredActions: required }),
+    unread: card("25", { actions: [], awaiting: "close-out" }),
+    streaming: card("26", { actions: [], status: "streaming" }),
+  };
+  const { home, run, dir } = await setup([note, ...Object.values(cases)]);
+  try {
+    await assert.rejects(run(["ack", "22", ...ids(cases.decision), "--request", "ack-req-22"]), /not a note/);
+    await assert.rejects(run(["ack", "23", ...ids(cases.attention), "--request", "ack-req-23"]), /not a note/);
+    await assert.rejects(run(["ack", "24", ...ids(cases.required), "--request", "ack-req-24"]), /required actions/);
+    await assert.rejects(run(["ack", "25", ...ids(cases.unread), "--request", "ack-req-25"]), /still with its author/);
+    await assert.rejects(run(["ack", "26", ...ids(cases.streaming), "--request", "ack-req-26"]), /not ready/);
+    await assert.rejects(run(["ack", "21", "--offer", "21-v0", "--lifecycle", "21-l1", "--request", "ack-req-27"]), /has changed/);
+    await assert.rejects(run(["ack", "21", "--offer", "21-v1", "--lifecycle", "21-l0", "--request", "ack-req-27"]), /has changed/);
+    await assert.rejects(run(["ack", "99", "--offer", "99-v1", "--lifecycle", "99-l1", "--request", "ack-req-27"]), /no longer showing/);
+    await assert.rejects(run(["ack", "21", "--lifecycle", "21-l1", "--request", "ack-req-27"]), /Name the card's current offer/);
+    await assert.rejects(run(["ack", "21", "--offer", "21-v1", "--request", "ack-req-27"]), /Name the card's current offer/);
+    await assert.rejects(run(["ack", "21", ...ids(note), "--request", "short"]), /fresh id/);
+    await assert.rejects(run(["ack", "21", ...ids(note)]), /fresh id/);
+    assert.equal(home.state.changes.length, 0, "nothing reached the home");
+    setEnabled(dir, false);
+    await assert.rejects(run(["ack", "21", ...ids(note), "--request", "ack-req-28"]), /bridge is off/);
+    assert.equal(home.state.changes.length, 0);
+  } finally {
+    await home.close();
+  }
+});
+
+test("a note that was replied under and is back on the stage closes, as the app's close does", async () => {
+  const answered = card("27", { actions: [], awaiting: "answer", sentBackAt: 5 });
+  const { home, run } = await setup([answered]);
+  try {
+    await run(["ack", "27", ...ids(answered), "--request", "ack-req-29"]);
+    assert.equal(home.state.changes.length, 1);
+  } finally {
+    await home.close();
+  }
+});
+
+test("a home that still lists the note after the close is reported as not acknowledged, and is recorded", async () => {
+  const { home, run, lines } = await setup([note]);
+  home.state.keepOnClose = true;
+  try {
+    const args = ["ack", "21", ...ids(note), "--request", "ack-req-30"];
+    await run(args);
+    assert.equal(lines.at(-1), "Not acknowledged: Infinitary still shows the note.");
+    await run(args);
+    assert.match(lines.at(-1), /^Not acknowledged/);
+    assert.equal(home.state.changes.length, 1);
+  } finally {
+    await home.close();
+  }
+});
+
+test("closing is never a read: the relay's read link cannot close a card, and the read channels exclude it", async () => {
+  const { READ_CHANNELS, HomeLink } = await import("../src/home.js");
+  assert.equal(READ_CHANNELS.has("inf:cards:close"), false);
+  const { home, dir } = await setup([note]);
+  try {
+    const link = new HomeLink(JSON.parse(readFileSync(join(dir, "grant.json"), "utf8")));
+    await link.open();
+    await assert.rejects(link.invoke("inf:cards:close", ["21"]), /not a read/);
+    link.close();
+    assert.equal(home.state.changes.length, 0);
+  } finally {
+    await home.close();
+  }
+});

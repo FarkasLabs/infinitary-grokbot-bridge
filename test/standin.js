@@ -84,6 +84,10 @@ export async function startHome({ cards = [] } = {}) {
             const c = state.cards.find((x) => x.id === cardId);
             const refusal = state.refuseAct ?? (c && c.actions?.some((a) => a.id === actionId) ? undefined : "undeclared");
             reply(refusal ? { refusal } : {});
+          } else if (f.channel === "inf:cards:close") {
+            state.changes.push({ channel: f.channel, args: f.args });
+            if (!state.keepOnClose) state.cards = state.cards.filter((c) => c.id !== f.args[0]);
+            reply({ ok: true });
           } else if (f.channel === "inf:cards:reply") {
             state.changes.push({ channel: f.channel, args: f.args });
             const thread = (state.threads ??= {})[f.args[0]] ??= [];

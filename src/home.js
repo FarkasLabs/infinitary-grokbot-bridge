@@ -15,8 +15,8 @@ export const READ_CHANNELS = new Set([
   "inf:cards:list", "inf:cards:picture", "inf:cards:thread", "inf:conversation:last-turn", "inf:conversation:state",
 ]);
 
-/** Acting: the three requests that change something, each only from a command that was asked for. */
-export const ACT_CHANNELS = new Set([...READ_CHANNELS, "inf:cards:act", "inf:cards:reply", "inf:converse"]);
+/** Acting: the requests that change something, each only from a command that was asked for. */
+export const ACT_CHANNELS = new Set([...READ_CHANNELS, "inf:cards:act", "inf:cards:reply", "inf:cards:close", "inf:converse"]);
 
 const MAX_FRAME = 64 * 1024 * 1024;
 

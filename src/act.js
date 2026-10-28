@@ -62,6 +62,36 @@ export async function answerCard(link, dir, opts) {
   return result;
 }
 
+/** Whether the captain's own stage shows the card (Infinitary's onStage, src/shared/cards.ts). */
+const onStage = (card) => card.awaiting === undefined || card.sentBackAt !== undefined;
+
+/**
+ * Acknowledges one note: Infinitary's own close (the captain's ×) on the exact version read.
+ * Only a note - no buttons, no required actions - that is ready and on the stage.
+ * The home records the offer and lifecycle on a close but does not enforce them, so the read
+ * just before the close is the only guard: a note revised in between would still be closed.
+ */
+export async function ackNote(link, dir, opts) {
+  const { cardId, offerId, lifecycleId, requestId } = opts;
+  const print = fingerprint(["ack", cardId, offerId, lifecycleId]);
+  const prior = claim(dir, requestId, print, { create: false });
+  if (!prior.fresh) return { ...prior.result, replayed: true };
+
+  const card = currentCard(await link.invoke("inf:cards:list", []), opts);
+  if (card.actions?.length) throw new Error(`Card ${cardId} has buttons, so it is not a note. Answer it with 'answer' instead.`);
+  if (card.requiredActions?.length) throw new Error(`Note ${cardId} lists required actions. Close it in Infinitary itself.`);
+  if (!onStage(card)) throw new Error(`Note ${cardId} is still with its author (${card.awaiting}). Acknowledge it once Infinitary shows it.`);
+
+  const acquired = claim(dir, requestId, print);
+  if (!acquired.fresh) return { ...acquired.result, replayed: true };
+  const { path } = acquired;
+  await link.invoke("inf:cards:close", [cardId, { id: requestId, lifecycleId, offerId }]);
+  const after = (await link.invoke("inf:cards:list", [])).find((c) => c.id === cardId && c.lifecycleId === lifecycleId);
+  const result = after ? { ok: false, refusal: "Infinitary still shows the note." } : { ok: true, title: card.title };
+  finish(path, result);
+  return result;
+}
+
 /** The newest message id in a thread, so only later ones are news. */
 const newest = (messages) => messages.reduce((m, x) => Math.max(m, Number(x.id) || 0), 0);
 

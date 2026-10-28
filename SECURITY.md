@@ -11,7 +11,7 @@ Only the latest release on the default branch is supported. This is a 0.x projec
 ## Threat model, short
 
 - **The pairing key is a full-access key.** The background relay only sends read requests, but that is the bridge's own choice, not a limit Infinitary enforces. Anyone who can read the key can connect to Infinitary as you and act as you. Keep the state folder (`~/.local/state/infinitary-grokbot-bridge`, mode 0700) private.
-- **Acting commands act as you.** `answer`, `reply` and `say` can press buttons, merges included, and message Infinitary's first mate. Give them to a bot only if you accept that. Merge, discard and kept writes also need `--confirm`.
+- **Acting commands act as you.** `answer`, `reply`, `ack` and `say` can press buttons, merges included, close notes (waking the crewmate who wrote one, as the app's × does), and message Infinitary's first mate. Give them to a bot only if you accept that. Merge, discard and kept writes also need `--confirm`.
 - **The webhook key** lives in a separate file you control (`webhook.env`, mode 0600), is read at send time, and is never logged. Whoever holds it can post to your Grok Bot.
 - **Pairing is loopback only** and pinned to the home's key. The bridge never listens on a network port.
 - **Card, thread and Inbox text is untrusted** and is never treated as an instruction by the bridge. A bot that reads it may still be misled, which is why acting is opt-in per use.
