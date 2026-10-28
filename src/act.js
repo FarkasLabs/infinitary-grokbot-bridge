@@ -1,5 +1,5 @@
 import { checkAnswers } from "./questions.js";
-import { claim, finish, fingerprint } from "./requests.js";
+import { answersPrint, claim, finish, fingerprint, mark, textPrint } from "./requests.js";
 
 const CARD_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
 const IDENT = /^[A-Za-z0-9_.:-]{1,64}$/;
@@ -50,16 +50,41 @@ export async function answerCard(link, dir, opts) {
   }
   const checked = checkAnswers(card, answers);
 
-  const acquired = claim(dir, requestId, print);
+  const acquired = claim(dir, requestId, print, { subject: { kind: "answer", cardId, lifecycleId, offerId, actionId, answersFp: answersPrint(checked) } });
   if (!acquired.fresh) return { ...acquired.result, replayed: true };
   const { path } = acquired;
   const submission = { id: requestId, lifecycleId, offerId, reading: "none" };
-  const reply = await link.invoke("inf:cards:act", [cardId, actionId, "chrome", checked.length ? { answers: checked } : null, submission]);
-  const result = reply?.refusal
-    ? { ok: false, refusal: String(reply.refusal), label: action.label }
-    : { ok: true, label: action.label, kind: effect.kind };
-  finish(path, result);
+  let reply;
+  try {
+    reply = await link.invoke("inf:cards:act", [cardId, actionId, "chrome", checked.length ? { answers: checked } : null, submission]);
+  } catch (e) {
+    mark(path, { outcome: "unknown" });
+    throw e;
+  }
+  let result;
+  if (reply?.refusal) result = { ok: false, refusal: String(reply.refusal), label: action.label };
+  else {
+    // Infinitary answers {} to a press on a card it no longer shows, so the press is confirmed by how the card ended.
+    result = await confirmPress(link, card, action, checked);
+    result.label = action.label;
+    result.kind = effect.kind;
+  }
+  finish(path, result, { outcome: result.ok ? "accepted" : result.unclear ? "unknown" : "refused" });
   return result;
+}
+
+async function confirmPress(link, card, action, checked) {
+  const still = (await link.invoke("inf:cards:list", [])).find((c) => c.id === card.id && c.lifecycleId === card.lifecycleId);
+  if (still) return { ok: false, refusal: "Infinitary still shows the card, so it did not take the press." };
+  let past;
+  try {
+    past = await link.invoke("inf:cards:past", [card.id]);
+  } catch {}
+  const end = past?.ending;
+  if (!end) return { ok: false, unclear: true, refusal: "Infinitary did not confirm how the card ended. The press may or may not have counted; read the card before deciding what to do next." };
+  if (end.how === "chose" && end.actionId === action.id && answersPrint(past.answers) === answersPrint(checked)) return { ok: true };
+  const how = end.how === "chose" ? `"${end.label ?? end.actionId}" was chosen` : `it ended (${end.how})`;
+  return { ok: false, refusal: `The card had already ended in Infinitary before this press: ${how}. Your press changed nothing.` };
 }
 
 /** Whether the captain's own stage shows the card (Infinitary's onStage, src/shared/cards.ts). */
@@ -82,13 +107,19 @@ export async function ackNote(link, dir, opts) {
   if (card.requiredActions?.length) throw new Error(`Note ${cardId} lists required actions. Close it in Infinitary itself.`);
   if (!onStage(card)) throw new Error(`Note ${cardId} is still with its author (${card.awaiting}). Acknowledge it once Infinitary shows it.`);
 
-  const acquired = claim(dir, requestId, print);
+  const acquired = claim(dir, requestId, print, { subject: { kind: "ack", cardId, lifecycleId, offerId } });
   if (!acquired.fresh) return { ...acquired.result, replayed: true };
   const { path } = acquired;
-  await link.invoke("inf:cards:close", [cardId, { id: requestId, lifecycleId, offerId }]);
-  const after = (await link.invoke("inf:cards:list", [])).find((c) => c.id === cardId && c.lifecycleId === lifecycleId);
-  const result = after ? { ok: false, refusal: "Infinitary still shows the note." } : { ok: true, title: card.title };
-  finish(path, result);
+  let result;
+  try {
+    await link.invoke("inf:cards:close", [cardId, { id: requestId, lifecycleId, offerId }]);
+    const after = (await link.invoke("inf:cards:list", [])).find((c) => c.id === cardId && c.lifecycleId === lifecycleId);
+    result = after ? { ok: false, refusal: "Infinitary still shows the note." } : { ok: true, title: card.title };
+  } catch (e) {
+    mark(path, { outcome: "unknown" });
+    throw e;
+  }
+  finish(path, result, { outcome: result.ok ? "accepted" : "refused" });
   return result;
 }
 
@@ -107,11 +138,20 @@ export async function replyToCard(link, dir, opts) {
   currentCard(await link.invoke("inf:cards:list", []), opts);
   const before = (await link.invoke("inf:cards:thread", [cardId]))?.messages ?? [];
   const baseline = newest(before);
-  const acquired = claim(dir, requestId, print);
+  const acquired = claim(dir, requestId, print, { subject: { kind: "reply", cardId, lifecycleId, offerId, textFp: textPrint(text) }, holdMs: waitMs + 15000 });
   if (!acquired.fresh) return { ...acquired.result, replayed: true };
   const { path } = acquired;
   const submission = { id: requestId, lifecycleId, offerId, reading: "none" };
-  const thread = await link.invoke("inf:cards:reply", [cardId, { text }, submission]);
+  let thread;
+  try {
+    thread = await link.invoke("inf:cards:reply", [cardId, { text }, submission]);
+  } catch (e) {
+    mark(path, { outcome: "unknown" });
+    throw e;
+  }
+  // Infinitary returns the thread with the written line in it, so the bridge's own line has an id.
+  const own = (thread?.messages ?? []).filter((m) => m.who === "captain" && m.text === text && Number(m.id) > baseline).at(-1);
+  mark(path, own ? { outcome: "accepted", lineId: Number(own.id) } : { outcome: "unknown" });
   const answers = [];
   const seenIds = new Set();
   const collect = (messages) => {
@@ -119,7 +159,7 @@ export async function replyToCard(link, dir, opts) {
       const id = Number(m.id) || 0;
       if (id > baseline && m.who !== "captain" && m.text && !seenIds.has(id)) {
         seenIds.add(id);
-        answers.push({ who: m.who, text: m.text });
+        answers.push({ id, who: m.who, text: m.text });
       }
     }
   };
@@ -131,7 +171,7 @@ export async function replyToCard(link, dir, opts) {
     collect(now);
   }
   const result = { ok: true, answers };
-  finish(path, result);
+  finish(path, result, { printed: answers.map((a) => a.id) });
   return result;
 }
 
@@ -153,6 +193,7 @@ export async function sayToFirstMate(link, dir, opts) {
     if (event && ["user_turn", "firstmate_reply"].includes(event.type)) seen.push(event);
   };
   link.on("push", onPush);
+  let open = null;
   try {
     const initialState = await link.invoke("inf:conversation:state", []);
     if (initialState?.busy !== false) throw new Error("The first mate is working or its idle state could not be confirmed. Nothing was sent; retry when the conversation is idle.");
@@ -160,12 +201,14 @@ export async function sayToFirstMate(link, dir, opts) {
       throw new Error("A conversation message arrived while checking the first mate. Nothing was sent; retry when the conversation is idle.");
     }
 
-    const acquired = claim(dir, requestId, print);
+    const acquired = claim(dir, requestId, print, { subject: { kind: "say", textFp: textPrint(text) }, holdMs: waitMs + 15000 });
     if (!acquired.fresh) return { ...acquired.result, replayed: true };
     const { path } = acquired;
+    open = path;
     try {
       await link.invoke("inf:converse", [{ text }]);
     } catch {
+      mark(path, { outcome: "unknown" });
       throw new Error("The first mate's acceptance was not confirmed. The message may have been sent; read 'last' before deciding what to do next.");
     }
 
@@ -189,7 +232,8 @@ export async function sayToFirstMate(link, dir, opts) {
           }
           if (state?.busy === false && turn?.you === text && turn?.reply?.text === replyEvent.text) {
             const result = { ok: true, reply: turn.reply };
-            finish(path, result);
+            finish(path, result, { outcome: "accepted", replyFp: textPrint(turn.reply.text) });
+            open = null;
             return result;
           }
         }
@@ -198,6 +242,7 @@ export async function sayToFirstMate(link, dir, opts) {
     }
     throw new Error("No safely correlated first-mate reply arrived before the wait ended. The message was sent; read 'last' before deciding what to do next.");
   } finally {
+    if (open) mark(open, { outcome: "unknown" });
     link.off("push", onPush);
   }
 }

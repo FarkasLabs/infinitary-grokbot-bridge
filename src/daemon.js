@@ -20,15 +20,18 @@ export function daemonAlive(dir) {
  * The long-running part. While the switch is on it holds one read-only connection to the home
  * and relays cards; while off it holds nothing open and sends nothing.
  */
-export async function runDaemon(dir, { send, openLink = (g) => new HomeLink(g), pollMs = 1000, tickMs = 30000, log = console.error } = {}) {
+export async function runDaemon(dir, { send, openLink = (g) => new HomeLink(g), pollMs = 1000, settlePollMs = 250, tickMs = 30000, log = console.error } = {}) {
   if (daemonAlive(dir) && daemonAlive(dir) !== process.pid) throw new Error("The bridge is already running.");
   writePrivate(pidPath(dir), String(process.pid));
+  let current = null;
   const relay = new Relay({
+    reads: { thread: (id) => current.invoke("inf:cards:thread", [id]), past: (id) => current.invoke("inf:cards:past", [id]) },
     dir,
     send: send ?? makeSender(defaultWebhookEnv()),
     enabled: () => isEnabled(dir),
     maxChars: Number(process.env.GROKBOT_BRIDGE_MAX_CHARS) || 3500,
     log,
+    pollMs: settlePollMs,
   });
   let link = null;
   let connecting = false;
@@ -46,6 +49,8 @@ export async function runDaemon(dir, { send, openLink = (g) => new HomeLink(g), 
       const welcome = await l.open();
       l.on("push", (channel, payload) => {
         if (channel === "inf:cards" && Array.isArray(payload)) relay.onCards(payload).catch((e) => log(e.message));
+        else if (channel === "inf:cards:thread") relay.onThread(payload);
+        else if (channel === "inf:event") relay.onEvent(payload);
       });
       l.once("close", () => {
         if (link === l) link = null;
@@ -53,6 +58,7 @@ export async function runDaemon(dir, { send, openLink = (g) => new HomeLink(g), 
         setStatus({ connected: false });
       });
       link = l;
+      current = l;
       backoff = 5000;
       const cards = await l.invoke("inf:cards:list", []);
       setStatus({ connected: true, home: welcome.name ?? null, cards: cards.length });
