@@ -367,11 +367,13 @@ test("a notice whose delivery is uncertain is not sent again", async () => {
 test("only while connected: what happened while cut off is not sent after reconnecting, and a restart does not repeat an ending", async () => {
   const r = await rig([plain("8"), plain("10")]);
   try {
+    r.home.hold(); // the connection stays down until released, so the cut-off window is not a race with the reconnect
     r.home.kick();
     await until(() => !r.daemon.link);
     r.home.state.endCard("8", { how: "chose", actionId: "go", by: "captain" });
     r.home.state.addLine("10", "captain", "typed while away");
-    await until(() => r.daemon.link, 8000);
+    r.home.release();
+    await until(() => r.daemon.link && r.daemon.relay.s.seen.has("10"), 8000); // the reconnected session has taken in the card
     await r.quiet();
     assert.equal(r.news().length, 0, "no catch-up of actions taken while disconnected");
     r.home.state.addLine("10", "captain", "typed now");

@@ -67,7 +67,7 @@ export async function startHome({ cards = [] } = {}) {
     if (req.headers.origin) return socket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
     if (req.url !== "/connection") return socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
     if (!known) return socket.end("HTTP/1.1 401 Unauthorized\r\n\r\n");
-    wss.handleUpgrade(req, socket, head, (ws) => {
+    const admit = () => wss.handleUpgrade(req, socket, head, (ws) => {
       state.sockets.add(ws);
       ws.on("close", () => state.sockets.delete(ws));
       let access = "full";
@@ -138,6 +138,7 @@ export async function startHome({ cards = [] } = {}) {
         }
       });
     });
+    if (state.hold) state.hold.push(admit); else admit();
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   const port = server.address().port;
@@ -146,6 +147,8 @@ export async function startHome({ cards = [] } = {}) {
     state, port, pin,
     link: (code = state.code) => `infinitary://join?as=mac&at=192.0.2.10:${port}&key=${pin}&code=${code}`,
     push: (cards) => { state.cards = cards; for (const ws of state.sockets) ws.send(JSON.stringify({ t: "push", seq: 1, channel: "inf:cards", payload: cards })); },
+    hold: () => { state.hold = []; },
+    release: () => { const h = state.hold ?? []; state.hold = null; for (const f of h) f(); },
     kick: () => { for (const ws of state.sockets) ws.terminate(); },
     close: () => new Promise((r) => { for (const ws of state.sockets) ws.terminate(); server.closeAllConnections?.(); server.close(r); }),
   };
