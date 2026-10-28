@@ -1,7 +1,7 @@
 {
   "name": "infinitary-grokbot-bridge",
   "version": "0.1.0",
-  "description": "Read-only bridge from a local Infinitary home to Grok bot: relays every card as text and draws pages on request.",
+  "description": "Bridge from a local Infinitary home to Grok Bot: relays every card as text, draws pages on request, and on explicit command can answer, reply and merge.",
   "type": "module",
   "private": true,
   "license": "MIT",
