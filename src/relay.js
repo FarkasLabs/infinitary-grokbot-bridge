@@ -62,7 +62,7 @@ export class Relay {
    * the session it was received in and does nothing once another has replaced it, so nothing carries over a reset.
    */
   #fresh(up = false, reads = this.reads) {
-    return { up, reads, known: new Map(), lastLine: new Map(), seen: new Set(), introduced: new Map(), baseline: new Map(), merges: new Map(), baselined: false, connectedAt: up ? Date.now() : Infinity };
+    return { up, reads, known: new Map(), lastLine: new Map(), seen: new Set(), introduced: new Map(), baseline: new Map(), merges: new Map(), baselined: false, early: new Map(), connectedAt: up ? Date.now() : Infinity };
   }
 
   #alive = (s) => this.s === s && s.up;
@@ -140,6 +140,7 @@ export class Relay {
           drop();
           continue;
         }
+        if (!this.outbox.includes(n)) continue; // the switch check itself discarded it: it is not sent
         n.inflight = true;
         let result = "sent";
         while (n.next < n.parts.length && result === "sent") {
@@ -160,41 +161,58 @@ export class Relay {
   /** The cards the home shows now: on connect, on switch-on, and with every change. */
   onCards(cards) {
     const s = this.s;
-    const run = this.cardsRun.then(() => this.#cards(s, cards));
+    // What the snapshot says is taken in the moment it arrives, however long earlier messages take to deliver.
+    const prior = this.cardsRun;
+    this.#note(s, cards, Date.now(), prior);
+    const run = prior.then(() => this.#cards(s, cards));
     this.cardsRun = run.catch((e) => this.log(e.message));
     return run;
+  }
+
+  #note(s, cards, arrivedAt, prior) {
+    if (!s.up || !this.enabled()) return;
+    const live = new Set(cards.map((c) => c.id));
+    const first = !s.baselined;
+    s.baselined = true;
+    for (const id of s.seen) if (!live.has(id)) (s.seen.delete(id), s.introduced.delete(id));
+    for (const c of cards) {
+      if (s.seen.has(c.id)) continue;
+      s.seen.add(c.id);
+      // On a connection's first snapshot, what was said since the connection began is news; later, since the card appeared.
+      s.introduced.set(c.id, first ? Math.min(arrivedAt, s.connectedAt) : arrivedAt);
+      s.baseline.set(c.id, this.#baseline(s, c.id, first ? undefined : 0));
+    }
+    // Card state changes in the same order as thread and event handling, so a queued update still finds its card.
+    this.#serial(async () => {
+      if (!this.#alive(s)) return;
+      const gone = [...s.known.keys()].filter((id) => !live.has(id));
+      // An ending is decided on what was delivered, so it waits for the deliveries before this snapshot.
+      if (gone.length || Object.keys(this.sent).some((id) => !live.has(id))) await prior.catch(() => {});
+      for (const id of gone) {
+        const was = s.known.get(id);
+        s.known.delete(id);
+        if (id in this.sent) await this.#ending(s, was);
+        if (!this.#alive(s)) return;
+        s.lastLine.delete(id);
+        s.early.delete(id);
+      }
+      for (const c of cards) s.known.set(c.id, c);
+      for (const id of Object.keys(this.sent)) if (!live.has(id)) delete this.sent[id];
+      this.#save();
+      for (const c of cards) {
+        const early = s.early.get(c.id);
+        if (!early) continue;
+        s.early.delete(c.id);
+        await this.#threadLines(s, early);
+      }
+    });
   }
 
   async #cards(s, cards) {
     if (!this.enabled()) return;
     const ready = cards.filter((c) => c.status !== "streaming");
     const live = new Set(cards.map((c) => c.id));
-    if (s.up) {
-      // Noted the moment they arrive, so what is said under a new card is never taken for its history.
-      const first = !s.baselined;
-      s.baselined = true;
-      for (const id of s.seen) if (!live.has(id)) (s.seen.delete(id), s.introduced.delete(id));
-      for (const c of cards) {
-        if (s.seen.has(c.id)) continue;
-        s.seen.add(c.id);
-        s.introduced.set(c.id, Date.now());
-        s.baseline.set(c.id, this.#baseline(s, c.id, first ? undefined : 0));
-      }
-      // Card state changes in the same order as thread and event handling, so a queued update still finds its card.
-      this.#serial(async () => {
-        if (!this.#alive(s)) return;
-        for (const [id, gone] of s.known) {
-          if (live.has(id)) continue;
-          s.known.delete(id);
-          if (id in this.sent) await this.#ending(s, gone);
-          if (!this.#alive(s)) return;
-          s.lastLine.delete(id);
-        }
-        for (const c of cards) s.known.set(c.id, c);
-        for (const id of Object.keys(this.sent)) if (!live.has(id)) delete this.sent[id];
-        this.#save();
-      });
-    } else for (const id of Object.keys(this.sent)) if (!live.has(id)) delete this.sent[id];
+    if (!s.up) for (const id of Object.keys(this.sent)) if (!live.has(id)) delete this.sent[id];
     const due = ready
       .filter((c) => this.sent[c.id] !== versionOf(c))
       .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
@@ -359,20 +377,27 @@ export class Relay {
   onThread(thread) {
     const s = this.s;
     return this.#serial(async () => {
-      await this.cardsRun;
-      await s.baseline.get(thread?.cardId);
-      if (!this.enabled() || !this.#alive(s)) return;
-      const card = s.known.get(thread?.cardId);
-      if (!card || !(card.id in this.sent)) return;
-      const messages = [...(thread.messages ?? [])].sort((a, b) => Number(a.id) - Number(b.id));
-      const newest = messages.reduce((m, x) => Math.max(m, Number(x.id) || 0), 0);
-      const last = s.lastLine.get(card.id);
-      s.lastLine.set(card.id, Math.max(newest, last ?? 0));
-      if (last === undefined) return;
-      for (const m of messages.filter((x) => Number(x.id) > last && x.text && ["captain", "crewmate", "firstmate"].includes(x.who))) {
-        await this.#line(s, card, m);
-      }
+      if (!this.#alive(s)) return;
+      // A card this connection has not been told of yet: kept, and read when the card arrives.
+      if (s.up && !s.known.has(thread?.cardId) && thread?.cardId !== undefined) return void s.early.set(thread.cardId, thread);
+      await this.#threadLines(s, thread);
     });
+  }
+
+  async #threadLines(s, thread) {
+    await this.cardsRun;
+    await s.baseline.get(thread?.cardId);
+    if (!this.enabled() || !this.#alive(s)) return;
+    const card = s.known.get(thread?.cardId);
+    if (!card || !(card.id in this.sent)) return;
+    const messages = [...(thread.messages ?? [])].sort((a, b) => Number(a.id) - Number(b.id));
+    const newest = messages.reduce((m, x) => Math.max(m, Number(x.id) || 0), 0);
+    const last = s.lastLine.get(card.id);
+    s.lastLine.set(card.id, Math.max(newest, last ?? 0));
+    if (last === undefined) return;
+    for (const m of messages.filter((x) => Number(x.id) > last && x.text && ["captain", "crewmate", "firstmate"].includes(x.who))) {
+      await this.#line(s, card, m);
+    }
   }
 
   async #line(s, card, m) {

@@ -60,14 +60,17 @@ export async function runDaemon(dir, { send, openLink = (g) => new HomeLink(g), 
       });
       link = l;
       backoff = 5000;
-      const cards = await l.invoke("inf:cards:list", []);
-      setStatus({ connected: true, home: welcome.name ?? null, cards: cards.length });
-      await relay.onUp({
+      // The session exists from the moment the connection does, so nothing said while the list is read is lost.
+      const up = relay.onUp({
         thread: (id) => l.invoke("inf:cards:thread", [id]),
         past: (id) => l.invoke("inf:cards:past", [id]),
         task: (id) => l.invoke("inf:tasks:detail", [id]),
       });
-      await relay.onCards(cards);
+      const cards = await l.invoke("inf:cards:list", []);
+      setStatus({ connected: true, home: welcome.name ?? null, cards: cards.length });
+      const shown = relay.onCards(cards);
+      await up;
+      await shown;
     } catch (e) {
       relay.onDown();
       log(`connect: ${e.message}`);

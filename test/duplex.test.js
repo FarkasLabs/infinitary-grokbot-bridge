@@ -372,8 +372,9 @@ test("only while connected: what happened while cut off is not sent after reconn
     await until(() => !r.daemon.link);
     r.home.state.endCard("8", { how: "chose", actionId: "go", by: "captain" });
     r.home.state.addLine("10", "captain", "typed while away");
+    await wait(5); // a line written in the very millisecond the connection begins cannot be told from one written just after it
     r.home.release();
-    await until(() => r.daemon.link && r.daemon.relay.s.seen.has("10"), 8000); // the reconnected session has taken in the card
+    await until(() => r.daemon.link, 8000);
     await r.quiet();
     assert.equal(r.news().length, 0, "no catch-up of actions taken while disconnected");
     r.home.state.addLine("10", "captain", "typed now");

@@ -179,3 +179,54 @@ test("R12: a card pass begun on a replaced connection does not delete or overwri
   await r.relay.onThread({ cardId: "1", messages: [{ id: 1, who: "captain", text: "after reconnect", at: Date.now() + 5 }] });
   assert.match(r.sent.at(-1), /after reconnect/, "its thread is still followed");
 });
+
+test("R1: a comment on an already relayed card, typed after reconnecting, is news even while another delivery stalls the card list", async () => {
+  const r = rig();
+  await r.relay.onUp(r.reads);
+  await r.relay.onCards([live()]); // card 1 relayed
+  r.relay.onDown();
+  const typed = [];
+  r.reads.thread = async () => ({ messages: typed });
+  await r.relay.onUp(r.reads);
+  r.gate = deferred(); // the webhook stalls on card 2's message
+  r.relay.onCards([live(card("2"))]);
+  r.relay.onCards([live(), live(card("2"))]); // the list that names card 1 arrives behind that stalled delivery
+  await wait(20);
+  typed.push({ id: 1, who: "captain", text: "typed while the webhook was slow", at: Date.now() });
+  r.relay.onThread({ cardId: "1", messages: typed });
+  await wait(20);
+  r.gate.resolve();
+  r.gate = null;
+  await r.relay.idle();
+  assert.match(r.sent.join("\n"), /typed while the webhook was slow/);
+});
+
+test("R1: a comment on a card pushed before the card list is read is kept and reported once the card is known", async () => {
+  const r = rig();
+  await r.relay.onUp(r.reads);
+  const first = { id: 1, who: "captain", text: "typed during connect", at: Date.now() + 5 };
+  r.reads.thread = async () => ({ messages: [] });
+  r.relay.onThread({ cardId: "1", messages: [first] });
+  await r.relay.onCards([live()]);
+  await r.relay.idle();
+  assert.match(r.sent.join("\n"), /typed during connect/);
+});
+
+test("R11: a notice the switch check itself discards while an earlier one is being sent is not sent", async () => {
+  const r = rig();
+  await r.relay.onUp(r.reads);
+  r.mode = "refuse";
+  await r.relay.onEvent({ type: "user_turn", text: "first words" });
+  await r.relay.onEvent({ type: "user_turn", text: "second words" });
+  assert.equal(r.relay.outbox.length, 2);
+  r.mode = "ok";
+  r.gate = deferred();
+  const flushed = r.relay.tick(); // sends the first, stalled in the webhook
+  await wait(20);
+  r.epochValue += 1; // the switch was written meanwhile
+  r.gate.resolve();
+  r.gate = null;
+  await flushed;
+  assert.deepEqual(r.sent.map((m) => /first/.test(m)), [true], "the first was already on its way; the second belongs to the time before");
+  assert.equal(r.relay.outbox.length, 0);
+});
