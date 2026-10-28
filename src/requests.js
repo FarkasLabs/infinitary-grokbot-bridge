@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export const REQUEST_ID = /^[A-Za-z0-9_-]{8,64}$/;
@@ -35,7 +35,14 @@ export function claim(stateDir, id, print, { create = true, subject, holdMs = 60
       return { fresh: true, path: null };
     }
   } else try {
-    writeFileSync(path, JSON.stringify({ print, state: "started", at: Date.now(), until: Date.now() + holdMs, subject }), { flag: "wx", mode: 0o600 });
+    // Written whole under a temporary name, then linked into place, so a reader never sees half a record.
+    const tmp = `${path}.${process.pid}.new`;
+    writeFileSync(tmp, JSON.stringify({ print, state: "started", at: Date.now(), until: Date.now() + holdMs, subject }), { mode: 0o600 });
+    try {
+      linkSync(tmp, path);
+    } finally {
+      rmSync(tmp, { force: true });
+    }
     return { fresh: true, path };
   } catch (e) {
     if (e.code !== "EEXIST") throw e;
@@ -54,7 +61,33 @@ export function claim(stateDir, id, print, { create = true, subject, holdMs = 60
 /** Adds facts to a request's record, for the relay to read: outcome, own thread line id, printed answers. */
 export function mark(path, patch) {
   const seen = JSON.parse(readFileSync(path, "utf8"));
-  writeFileSync(path, JSON.stringify({ ...seen, ...patch }), { mode: 0o600 });
+  const tmp = `${path}.${process.pid}.new`;
+  writeFileSync(tmp, JSON.stringify({ ...seen, ...patch }), { mode: 0o600 });
+  renameSync(tmp, path);
+}
+
+/**
+ * The relay's own facts about a request (an echo it has already skipped) live beside the record, never in it,
+ * so the command that owns the record and the daemon that reads it cannot overwrite each other.
+ */
+const markerPath = (path, name) => path.replace(/\.json$/, `.${name}`);
+export const hasMarker = (path, name) => {
+  try {
+    statSync(markerPath(path, name));
+    return true;
+  } catch {
+    return false;
+  }
+};
+/** True only for the one caller that creates it. */
+export function claimMarker(path, name) {
+  try {
+    closeSync(openSync(markerPath(path, name), "wx", 0o600));
+    return true;
+  } catch (e) {
+    if (e.code === "EEXIST") return false;
+    throw e;
+  }
 }
 
 export function finish(path, result, patch = {}) {
@@ -65,7 +98,7 @@ export function finish(path, result, patch = {}) {
 export function readRequests(stateDir) {
   const dir = dirOf(stateDir);
   const out = [];
-  for (const f of readdirSync(dir)) {
+  for (const f of readdirSync(dir).filter((f) => f.endsWith(".json"))) {
     try {
       out.push({ id: f.replace(/\.json$/, ""), path: join(dir, f), ...JSON.parse(readFileSync(join(dir, f), "utf8")) });
     } catch {}

@@ -117,6 +117,7 @@ export async function startHome({ cards = [] } = {}) {
             const thread = (state.threads ??= {})[f.args[0]] ??= [];
             state.addLine(f.args[0], "captain", f.args[1].text);
             if (state.answerReplyInInitialResponse) state.addLine(f.args[0], "crewmate", state.answerReplyInInitialResponse);
+            if (state.cutOnReply) return ws.terminate();
             reply({ cardId: f.args[0], messages: thread });
             if (state.answerReply) setTimeout(() => state.addLine(f.args[0], "crewmate", state.answerReply), 60);
           } else if (f.channel === "inf:converse") {

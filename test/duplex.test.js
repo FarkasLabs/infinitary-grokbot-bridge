@@ -3,6 +3,7 @@
 // first-mate conversation are included; only what happens while connected; an unclear request is reconciled, not repeated.
 // Runs the real daemon and the real commands against a stand-in home at the wire, with a fake webhook and a scratch state folder.
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -32,9 +33,15 @@ async function rig(cards, { state = {}, daemon = {} } = {}) {
   await pair(home.link(), dir);
   setEnabled(dir, true);
   const sent = [];
-  const send = async (m) => (sent.push(m), { ok: true, status: 200 });
-  const start = () => runDaemon(dir, { send, pollMs: 20, settlePollMs: 10, log: () => {}, ...daemon });
-  const r = { home, dir, sent, start, lines: [] };
+  const r = { home, dir, sent, lines: [], attempts: 0, webhook: "ok" };
+  const send = async (m) => {
+    r.attempts += 1;
+    if (r.webhook === "refuse") return { ok: false, status: 403, rejected: true };
+    if (r.webhook === "unsure") return { ok: false, reason: "request failed (TimeoutError)" };
+    return sent.push(m), { ok: true, status: 200 };
+  };
+  const start = () => runDaemon(dir, { send, pollMs: 20, settlePollMs: 10, tickMs: 100, log: () => {}, ...daemon });
+  r.start = start;
   const env = { ...process.env, GROKBOT_BRIDGE_HOME: dir, GROKBOT_BRIDGE_POLL_MS: "20" };
   r.run = (argv, stdin = "") => main(argv, { out: (s) => r.lines.push(s), env, stdin: Object.assign((async function* () { yield stdin; })(), { isTTY: false }) });
   r.daemon = await start();
@@ -166,25 +173,162 @@ test("conversation: your message to the first mate and its answer are sent; thos
   }
 });
 
-test("merge: the click says merge requested, never merged, and the later result is sent, also after a Grok bot merge request", async () => {
+test("merge: the click says merge requested, never merged; a merged closure is the result, also when it comes before the card's removal", async () => {
   const r = await rig([mergeCard, { ...mergeCard, id: "12", taskId: "t12", offerId: "12-v1", lifecycleId: "12-l1" }]);
+  const closed = (taskId, seq) => ({ type: "task_changed", taskId, key: "T", kind: "work", status: "done", from: "open", activity: null, closedReason: "merged", seq });
   try {
     r.home.state.endCard("9", { how: "chose", actionId: "merge", by: "captain" });
     await until(() => r.news().length === 1);
     assert.match(r.news()[0], /^In Infinitary · you pressed "Merge the pull request" on "Ready to merge" \(card 9\): merge requested\. It is not merged yet/);
-    r.home.state.pushEvent({ type: "task_changed", taskId: "t9", key: "T-9", kind: "work", status: "done", from: "open", activity: null, closedReason: "merged", seq: 3 });
+    r.home.state.pushEvent(closed("t9", 3));
     await until(() => r.news().length === 2);
     assert.equal(r.news()[1], 'Merge result · "Ready to merge" is merged.');
-    // Grok bot requests the merge: its click is silent, its result is not.
+    // Grok bot requests the merge: its click is silent. Infinitary publishes the merged result before the card's removal.
+    r.home.state.pushEvent(closed("t12", 4));
     await r.run(["answer", "12", "merge", "--offer", "12-v1", "--lifecycle", "12-l1", "--request", "req-hhhhhhhh", "--confirm"]);
-    await r.quiet();
-    assert.equal(r.news().length, 2);
-    r.home.state.pushEvent({ type: "task_event", taskId: "t12", key: "T-12", kind: "failed", text: "Failed: checks did not pass", at: 1, feed: true });
     await until(() => r.news().length === 3);
-    assert.equal(r.news()[2], 'Merge result · "Ready to merge" did not merge: Failed: checks did not pass');
-    r.home.state.pushEvent({ type: "task_changed", taskId: "t12", key: "T-12", kind: "work", status: "done", from: "open", activity: null, closedReason: "merged", seq: 4 });
+    assert.equal(r.news()[2], 'Merge result · "Ready to merge" is merged.');
+    r.home.state.pushEvent(closed("t12", 5));
     await r.quiet();
     assert.equal(r.news().length, 3, "each merge reports once");
+  } finally {
+    await r.done();
+  }
+});
+
+test("merge: a task failure is not a merge failure; Infinitary's own note about the request is passed on once, in its words", async () => {
+  const r = await rig([mergeCard]);
+  try {
+    r.home.state.endCard("9", { how: "chose", actionId: "merge", by: "captain" });
+    await until(() => r.news().length === 1);
+    r.home.state.pushEvent({ type: "task_event", taskId: "t9", key: "T-9", kind: "failed", text: "Failed: the crewmate stopped", at: 1, feed: true });
+    r.home.state.pushEvent({ type: "firstmate_note", text: 'Putting the change in for "Ready to merge" - the result will appear here.' });
+    await r.quiet();
+    assert.equal(r.news().length, 1, "neither a crewmate failure nor the acknowledgement is a merge result");
+    r.home.state.pushEvent({ type: "firstmate_note", text: 'Merge refused for "Ready to merge": checks have not passed.' });
+    r.home.state.pushEvent({ type: "task_event", taskId: "t9", key: "T-9", kind: "note", text: "Refused again", at: 2, feed: true });
+    await until(() => r.news().length === 2);
+    await r.quiet();
+    assert.equal(r.news().length, 2);
+    assert.equal(r.news()[1], 'Merge update · "Ready to merge": Infinitary says: Merge refused for "Ready to merge": checks have not passed.');
+  } finally {
+    await r.done();
+  }
+});
+
+test("a card introduced after connecting: its first comment is sent", async () => {
+  const r = await rig([]);
+  try {
+    r.home.push([plain("20")]);
+    await until(() => r.news().length === 1);
+    r.home.state.addLine("20", "captain", "first words");
+    await until(() => r.news().length === 2);
+    assert.match(r.news()[1], /you commented under "Card 20" \(card 20\): first words/);
+  } finally {
+    await r.done();
+  }
+});
+
+test("a comment queued behind a running command is still sent when its card is removed right after", async () => {
+  const r = await rig([plain("8"), plain("21")], { state: { delayReply: { channel: "inf:cards:act", occurrence: 1, ms: 500 } } });
+  try {
+    const press = r.run(["answer", "8", "go", ...ids(plain("8")), "--request", "req-iiiiiiii"]);
+    await wait(100);
+    r.home.state.addLine("21", "captain", "last words");
+    r.home.state.endCard("21", { how: "chose", actionId: "go", by: "captain" });
+    await press;
+    await until(() => r.news().length === 2);
+    assert.match(r.news()[0], /you commented under "Card 21" \(card 21\): last words/);
+    assert.match(r.news()[1], /you answered "Card 21"/);
+  } finally {
+    await r.done();
+  }
+});
+
+test("a say whose echo the daemon was not connected for gives no credit: the same words later are news", async () => {
+  const r = await rig([], { state: { answerSay: "Fine." } });
+  try {
+    r.daemon.stop();
+    await r.run(["say", "--request", "req-jjjjjjjj", "--wait", "5"], "status please");
+    r.daemon = await r.start();
+    await until(() => r.daemon.link);
+    r.mark = r.sent.length;
+    r.home.state.pushEvent({ type: "user_turn", text: "status please" });
+    r.home.state.pushEvent({ type: "firstmate_reply", text: "Fine." });
+    await until(() => r.news().length === 2);
+  } finally {
+    await r.done();
+  }
+});
+
+test("an unclear reply is reported once for its card version; the same words later are an ordinary comment", async () => {
+  const r = await rig([plain("8")], { state: { cutOnReply: true } });
+  try {
+    await assert.rejects(r.run(["reply", "8", ...ids(plain("8")), "--request", "req-kkkkkkkk", "--wait", "1"], "same words"), /closed/);
+    await until(() => r.news().length === 1);
+    assert.match(r.news()[0], /^Request req-kkkkkkkk \(reply\): its outcome is unclear\./);
+    r.home.state.addLine("8", "captain", "same words");
+    await until(() => r.news().length === 2);
+    assert.match(r.news()[1], /^In Infinitary · you commented/);
+  } finally {
+    await r.done();
+  }
+});
+
+test("a request record is never seen half written while another process updates it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-rec-"));
+  const { claim, mark, readRequests } = await import("../src/requests.js");
+  const { path } = claim(dir, "req-llllllll", "p", { subject: { kind: "answer", cardId: "1" } });
+  const writer = spawn(process.execPath, ["--input-type=module", "-e",
+    `import { mark } from ${JSON.stringify(new URL("../src/requests.js", import.meta.url).href)}; for (let i = 0; i < 4000; i++) mark(${JSON.stringify(path)}, { n: i, pad: "x".repeat(2000) });`]);
+  let reads = 0;
+  while (writer.exitCode === null) {
+    const [rec] = readRequests(dir);
+    assert.equal(rec?.subject?.cardId, "1", "the record is always there, whole");
+    reads += 1;
+    await wait(0);
+  }
+  assert.ok(reads > 5);
+  void mark;
+});
+
+// Intent (captain's R8 choice): a notice the webhook definitely rejected is kept and retried, in order, once, with its
+// receipt written only after acceptance; one whose delivery is uncertain is not sent again.
+test("a definitely rejected notice is retried in order after acceptance, once each, and its receipt waits for acceptance", async () => {
+  const r = await rig([plain("8"), plain("10")]);
+  try {
+    r.webhook = "refuse";
+    const before = r.attempts;
+    r.home.state.endCard("8", { how: "chose", actionId: "go", by: "captain" });
+    r.home.state.addLine("10", "captain", "second thing");
+    await until(() => r.attempts >= before + 3);
+    assert.equal(r.news().length, 0);
+    assert.doesNotMatch(readFileSync(join(r.dir, "relay.json"), "utf8"), /"ended":\["8:/, "no receipt while rejected");
+    r.webhook = "ok";
+    await until(() => r.news().length === 2);
+    assert.match(r.news()[0], /you answered "Card 8"/);
+    assert.match(r.news()[1], /you commented under "Card 10" \(card 10\): second thing/);
+    await r.quiet();
+    await wait(300);
+    assert.equal(r.news().length, 2, "each is accepted once");
+    assert.match(readFileSync(join(r.dir, "relay.json"), "utf8"), /"ended":\["8:8-l1"\]/);
+  } finally {
+    await r.done();
+  }
+});
+
+test("a notice whose delivery is uncertain is not sent again", async () => {
+  const r = await rig([plain("8")]);
+  try {
+    r.webhook = "unsure";
+    const before = r.attempts;
+    r.home.state.endCard("8", { how: "chose", actionId: "go", by: "captain" });
+    await until(() => r.attempts > before);
+    const tried = r.attempts;
+    r.webhook = "ok";
+    await wait(500);
+    assert.equal(r.attempts, tried);
+    assert.equal(r.news().length, 0);
   } finally {
     await r.done();
   }

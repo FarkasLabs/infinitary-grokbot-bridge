@@ -54,7 +54,7 @@ export function loadWebhook(path) {
 export function makeSender(path, { fetchImpl = fetch, timeoutMs = 15000 } = {}) {
   return async function send(text) {
     const hook = loadWebhook(path);
-    if (hook.problem) return { ok: false, reason: hook.problem };
+    if (hook.problem) return { ok: false, rejected: true, reason: hook.problem };
     try {
       const res = await fetchImpl(hook.url, {
         method: "POST",
@@ -63,7 +63,9 @@ export function makeSender(path, { fetchImpl = fetch, timeoutMs = 15000 } = {}) 
         body: text,
         signal: AbortSignal.timeout(timeoutMs),
       });
-      return { ok: res.status >= 200 && res.status < 300, status: res.status };
+      const ok = res.status >= 200 && res.status < 300;
+      // A 4xx answer is a definite refusal: nothing was delivered. A 5xx, a timeout or a cut connection may have been.
+      return { ok, status: res.status, ...(res.status >= 400 && res.status < 500 ? { rejected: true } : {}) };
     } catch (error) {
       return { ok: false, reason: `request failed (${error?.name ?? "error"})` };
     }

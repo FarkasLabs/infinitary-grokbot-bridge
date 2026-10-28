@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
 import { readJson, receiptsPath, writePrivate } from "./state.js";
 import { effectOf } from "./act.js";
-import { commentNotice, endingNotice, endingWhat, mergeResultNotice, replyNotice, threadAnswerNotice, turnNotice, unclearNotice } from "./notices.js";
-import { answersPrint, mark, readRequests, textPrint } from "./requests.js";
+import { commentNotice, endingNotice, endingWhat, mergeResultNotice, mergeUpdateNotice, replyNotice, threadAnswerNotice, turnNotice, unclearNotice } from "./notices.js";
+import { answersPrint, claimMarker, hasMarker, readRequests, textPrint } from "./requests.js";
 import { cardMessage, chunk } from "./text.js";
 
 export const CATCH_UP_MAX = 5;
 export const OFFLINE_AFTER_MS = 10 * 60 * 1000;
+const OUTBOX_MAX = 100;
+const OUTBOX_MAX_AGE = 60 * 60 * 1000;
 
 /** The card's current version: the home's offerId, or a hash of what a person reads. */
 export const versionOf = (card) =>
@@ -33,6 +35,9 @@ export class Relay {
     this.downSince = null;
     this.queue = Promise.resolve();
     this.work = Promise.resolve();
+    this.outbox = [];
+    this.flushing = Promise.resolve();
+    this.seq = 0;
     this.#liveReset();
   }
 
@@ -41,7 +46,9 @@ export class Relay {
     this.known = new Map();
     this.lastLine = new Map();
     this.merges = new Map();
+    this.merged = new Set();
     this.baselined = false;
+    this.connectedAt = Infinity;
   }
 
   /** Handled one at a time, in arrival order. */
@@ -60,42 +67,96 @@ export class Relay {
     writePrivate(receiptsPath(this.dir), JSON.stringify({ sent: this.sent, noticeSent: this.noticeSent, ended: this.ended.slice(-200) }));
   }
 
-  /** One message, in chunks, in order; false if the first chunk was not accepted. */
-  async #emit(text) {
-    if (!this.enabled()) return false;
+  /**
+   * One message, in chunks, in order. "sent": accepted. "rejected": the first chunk was definitely refused (settings
+   * problem or a 4xx answer), so nothing reached Grok bot and it can be tried again. "unknown": the first chunk failed
+   * in a way that may still have been delivered. "off": the switch is off.
+   */
+  async #deliver(text) {
+    if (!this.enabled()) return "off";
     const run = this.queue.then(async () => {
       let first = true;
       for (const part of chunk(text, this.maxChars)) {
-        if (!this.enabled()) return !first;
+        if (!this.enabled()) return first ? "off" : "sent";
         const r = await this.rawSend(part);
         if (!r.ok) {
           this.log(`webhook send failed: ${r.status ?? r.reason}`);
-          return !first;
+          if (!first) return "sent";
+          return r.rejected === true || (r.status >= 400 && r.status < 500) ? "rejected" : "unknown";
         }
         first = false;
       }
-      return true;
+      return "sent";
     });
     this.queue = run.catch(() => {});
     return run;
   }
 
+  /** One message; false if the first chunk was not accepted. */
+  async #emit(text) {
+    return (await this.#deliver(text)) === "sent";
+  }
+
+  /**
+   * A notice about what happened in Infinitary. It leaves the outbox only when the webhook accepted it, so a definite
+   * rejection is tried again, in order, at the next notice, tick or reconnect. A failure that may have been delivered
+   * is not sent again. `id` is its stable identity: the same notice is never queued twice. `onSent` records its receipt.
+   * The outbox lives in memory: a restart or the switch going off drops it, like every other live-only fact.
+   */
+  #notify(id, text, onSent) {
+    if (!this.outbox.some((n) => n.id === id)) {
+      this.outbox.push({ id, text, onSent, at: Date.now() });
+      if (this.outbox.length > OUTBOX_MAX) this.log(`dropped an unsent notice: ${this.outbox.shift().id}`);
+    }
+    return this.#flush();
+  }
+
+  #flush() {
+    const run = this.flushing.then(async () => {
+      while (this.outbox.length) {
+        const n = this.outbox[0];
+        if (!this.enabled() || Date.now() - n.at > OUTBOX_MAX_AGE) {
+          this.outbox.shift();
+          continue;
+        }
+        const result = await this.#deliver(n.text);
+        if (result === "rejected") return;
+        this.outbox.shift();
+        if (result === "sent") n.onSent?.();
+        else this.log(`not sure ${n.id} was delivered; not sent again`);
+      }
+    });
+    this.flushing = run.catch((e) => this.log(e.message));
+    return run;
+  }
+
   /** The cards the home shows now: on connect, on switch-on, and with every change. */
-  async onCards(cards) {
+  onCards(cards) {
+    const run = this.#cards(cards);
+    this.cardsRun = run.catch(() => {});
+    return run;
+  }
+
+  async #cards(cards) {
     if (!this.enabled()) return;
     const ready = cards.filter((c) => c.status !== "streaming");
     const live = new Set(cards.map((c) => c.id));
-    const first = !this.baselined;
-    this.baselined = true;
-    for (const [id, gone] of this.known) {
-      if (live.has(id)) continue;
-      this.known.delete(id);
-      this.lastLine.delete(id);
-      if (id in this.sent) this.#serial(() => this.#ending(gone));
-    }
-    for (const c of cards) this.known.set(c.id, c);
-    if (first) this.#serial(() => this.#baseline(cards));
-    for (const id of Object.keys(this.sent)) if (!live.has(id)) delete this.sent[id];
+    // Card state changes in the same order as thread and event handling, so a queued update still finds its card.
+    this.#serial(async () => {
+      const first = !this.baselined;
+      this.baselined = true;
+      for (const [id, gone] of this.known) {
+        if (live.has(id)) continue;
+        this.known.delete(id);
+        if (id in this.sent) await this.#ending(gone);
+        this.lastLine.delete(id);
+      }
+      const introduced = cards.filter((c) => !this.known.has(c.id));
+      for (const c of cards) this.known.set(c.id, c);
+      await this.#baseline(introduced, first ? undefined : 0);
+      for (const id of Object.keys(this.sent)) if (!live.has(id)) delete this.sent[id];
+      this.#save();
+    });
     const due = ready
       .filter((c) => this.sent[c.id] !== versionOf(c))
       .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
@@ -117,6 +178,8 @@ export class Relay {
   async onUp() {
     this.downSince = null;
     this.#liveReset();
+    this.connectedAt = Date.now();
+    await this.#flush();
     if (this.noticeSent) {
       if (await this.#emit("Infinitary is back.")) {
         this.noticeSent = false;
@@ -135,8 +198,10 @@ export class Relay {
   async tick() {
     if (!this.enabled()) {
       this.downSince = null;
+      this.outbox.length = 0;
       return;
     }
+    await this.#flush();
     if (this.downSince !== null && !this.noticeSent && this.now() - this.downSince >= OFFLINE_AFTER_MS) {
       if (await this.#emit("Infinitary has been closed or unreachable for ten minutes. I will say when it is back.")) {
         this.noticeSent = true;
@@ -147,13 +212,15 @@ export class Relay {
 
   // --- What happened in Infinitary itself, while connected. ---
 
-  async #baseline(cards) {
+  /** Where each thread stands now. A card that appeared after connecting starts at 0 if its thread cannot be read, so its first line is news. */
+  async #baseline(cards, fallback) {
     for (const c of cards) {
       try {
         const thread = await this.reads.thread?.(c.id);
         this.lastLine.set(c.id, (thread?.messages ?? []).reduce((m, x) => Math.max(m, Number(x.id) || 0), 0));
       } catch (e) {
         this.log(`thread read: ${e.message}`);
+        if (fallback !== undefined) this.lastLine.set(c.id, fallback);
       }
     }
   }
@@ -168,16 +235,11 @@ export class Relay {
     }
   }
 
-  async #say(text) {
-    if (await this.#emit(text)) return true;
-    return false;
-  }
-
   /** A card Grok bot knew has left: say how it ended, unless an accepted Grok bot command did exactly that. */
   async #ending(card) {
     if (!this.enabled()) return;
     const key = `${card.id}:${card.lifecycleId}`;
-    if (this.ended.includes(key)) return;
+    if (this.ended.includes(key) || this.outbox.some((n) => n.id === `end:${key}`)) return;
     const past = await this.reads.past?.(card.id).catch((e) => (this.log(`past read: ${e.message}`), null));
     const e = past?.ending;
     if (!e || !["chose", "dismissed"].includes(e.how) || (e.by && e.by !== "captain")) return;
@@ -196,16 +258,23 @@ export class Relay {
     }
     const action = card.actions?.find((a) => a.id === e.actionId);
     const merge = e.how === "chose" && action && effectOf(action).kind === "merge";
-    if (merge && card.taskId) this.merges.set(card.taskId, { title: card.title, at: Date.now() });
-    this.ended.push(key);
-    if (silent) return this.#save();
-    await this.#say(unclear ? unclearNotice(unclear, endingWhat(card, past)) : endingNotice(card, past, { merge }));
-    this.#save();
+    const done = () => {
+      this.ended.push(key);
+      this.#save();
+    };
+    if (silent) done();
+    else await this.#notify(`end:${key}`, unclear ? unclearNotice(unclear, endingWhat(card, past)) : endingNotice(card, past, { merge }), done);
+    // Infinitary may publish a fast result before it publishes the card's removal.
+    if (merge && card.taskId) {
+      if (this.merged.has(card.taskId)) await this.#notify(`merge:${card.taskId}:result`, mergeResultNotice(card.title, true));
+      else this.merges.set(card.taskId, { title: card.title, at: Date.now(), updated: false });
+    }
   }
 
   /** A card's thread changed (inf:cards:thread). */
   onThread(thread) {
     return this.#serial(async () => {
+      await this.cardsRun;
       const card = this.known.get(thread?.cardId);
       if (!this.enabled() || !card || !(card.id in this.sent)) return;
       const messages = [...(thread.messages ?? [])].sort((a, b) => Number(a.id) - Number(b.id));
@@ -220,17 +289,17 @@ export class Relay {
   }
 
   async #line(card, m) {
-    const replies = (r) => r.subject.kind === "reply" && r.subject.cardId === card.id;
+    const replies = (r) => r.subject.kind === "reply" && r.subject.cardId === card.id && r.subject.lifecycleId === card.lifecycleId;
     const id = Number(m.id);
     if (m.who === "captain") {
       const recs = await this.#records(replies, (r) => r.state === "started" && r.outcome === undefined && r.until > Date.now());
       if (recs.some((r) => r.outcome === "accepted" && r.lineId === id)) return;
-      const unclear = recs.find((r) => r.outcome !== "accepted" && r.outcome !== "refused" && r.subject.textFp === textPrint(m.text));
-      return void (await this.#say(unclear ? unclearNotice(unclear, `A comment under ${JSON.stringify(card.title)} (card ${card.id}) reads: ${m.text}\n`) : commentNotice(card, m)));
+      const unclear = recs.find((r) => r.outcome !== "accepted" && r.outcome !== "refused" && r.subject.textFp === textPrint(m.text) && !hasMarker(r.path, "line") && claimMarker(r.path, "line"));
+      return void (await this.#notify(`line:${card.id}:${id}`, unclear ? unclearNotice(unclear, `A comment under ${JSON.stringify(card.title)} (card ${card.id}) reads: ${m.text}\n`) : commentNotice(card, m)));
     }
     const recs = await this.#records(replies, (r) => r.state === "started" && r.until > Date.now());
     if (recs.some((r) => (r.printed ?? []).includes(id))) return;
-    await this.#say(threadAnswerNotice(card, m));
+    await this.#notify(`line:${card.id}:${id}`, threadAnswerNotice(card, m));
   }
 
   /** inf:event: the conversation with the first mate, and what happens to a task whose merge was requested. */
@@ -241,32 +310,45 @@ export class Relay {
       if (!this.enabled()) return;
       if (event.type === "user_turn") return this.#turn(event.text);
       if (event.type === "firstmate_reply") return this.#firstMateReply(event.text);
-      const pending = this.merges.get(event.taskId);
-      if (!pending) return;
-      const merged = (event.type === "task_event" && ["merged", "landed"].includes(event.kind)) ||
+      const closed = (event.type === "task_event" && ["merged", "landed"].includes(event.kind)) ||
         (event.type === "task_changed" && event.status === "done" && ["merged", "landed"].includes(event.closedReason));
-      const failed = (event.type === "task_event" && event.kind === "failed") ||
-        (event.type === "task_changed" && ["dropped", "done"].includes(event.status) && ["failed", "cancelled", "discarded"].includes(event.closedReason));
-      if (!merged && !failed) return;
-      this.merges.delete(event.taskId);
-      await this.#say(mergeResultNotice(pending.title, merged, event.type === "task_event" ? event.text : ""));
+      if (closed) this.merged.add(event.taskId);
+      const taskId = event.type === "firstmate_note" && !event.taskId
+        ? [...this.merges].find(([, p]) => String(event.text).includes(`"${p.title}"`))?.[0]
+        : event.taskId;
+      const pending = this.merges.get(taskId);
+      if (!pending) return;
+      if (closed) {
+        this.merges.delete(taskId);
+        return void (await this.#notify(`merge:${taskId}:result`, mergeResultNotice(pending.title, true)));
+      }
+      // A task failure is not a merge failure: Infinitary reports a refusal or a merged reference as a note, so its own words are passed on.
+      const ACK = /result will appear here|is queued and will run/;
+      const note = (event.type === "task_event" && event.kind === "note" && event.feed) || event.type === "firstmate_note";
+      if (note && !pending.updated && event.text && !ACK.test(event.text)) {
+        pending.updated = true;
+        await this.#notify(`merge:${taskId}:update`, mergeUpdateNotice(pending.title, event.text));
+      }
     });
   }
 
+  /** Only a say the daemon was connected for can have echoed here: one that ran before this connection began cannot. */
+  #live = (r) => r.at >= this.connectedAt && Date.now() - r.at < 15 * 60 * 1000;
+
   async #turn(text) {
-    const say = (r) => r.subject.kind === "say" && r.subject.textFp === textPrint(text) && !r.turnEchoed && Date.now() - r.at < 15 * 60 * 1000;
+    const say = (r) => r.subject.kind === "say" && r.subject.textFp === textPrint(text) && this.#live(r) && !hasMarker(r.path, "turn");
     const recs = await this.#records(say, (r) => r.state === "started" && r.outcome === undefined && r.until > Date.now());
     const own = recs.find((r) => r.outcome === "accepted") ?? recs.find((r) => r.outcome === "unknown" || (r.state === "started" && r.outcome === undefined));
-    if (own) mark(own.path, { turnEchoed: true });
+    if (own && !claimMarker(own.path, "turn")) return this.#turn(text);
     if (own?.outcome === "accepted") return;
-    await this.#say(own ? unclearNotice(own, `The first mate was told: ${text}\n`) : turnNotice(text));
+    await this.#notify(`turn:${this.seq++}`, own ? unclearNotice(own, `The first mate was told: ${text}\n`) : turnNotice(text));
   }
 
   async #firstMateReply(text) {
-    const say = (r) => r.subject.kind === "say" && Date.now() - r.at < 15 * 60 * 1000;
+    const say = (r) => r.subject.kind === "say" && this.#live(r);
     const recs = await this.#records(say, (r) => r.state === "started" && r.until > Date.now());
-    const own = recs.find((r) => r.outcome === "accepted" && r.replyFp === textPrint(text) && !r.replyEchoed);
-    if (own) return mark(own.path, { replyEchoed: true });
-    await this.#say(replyNotice(text));
+    const own = recs.find((r) => r.outcome === "accepted" && r.replyFp === textPrint(text) && !hasMarker(r.path, "reply"));
+    if (own && claimMarker(own.path, "reply")) return;
+    await this.#notify(`reply:${this.seq++}`, replyNotice(text));
   }
 }

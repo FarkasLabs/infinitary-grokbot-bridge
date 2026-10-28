@@ -34,5 +34,5 @@ export const threadAnswerNotice = (card, m) =>
   `In Infinitary · ${m.who === "firstmate" ? "the first mate" : "the crewmate"} answered under ${quote(card.title)} (card ${card.id}): ${m.text}`;
 export const turnNotice = (text) => `In Infinitary · you told the first mate: ${text}`;
 export const replyNotice = (text) => `In Infinitary · the first mate answered: ${text}`;
-export const mergeResultNotice = (title, ok, text) =>
-  ok ? `Merge result · ${quote(title)} is merged.` : `Merge result · ${quote(title)} did not merge${text ? `: ${text}` : "."}`;
+export const mergeResultNotice = (title) => `Merge result · ${quote(title)} is merged.`;
+export const mergeUpdateNotice = (title, text) => `Merge update · ${quote(title)}: Infinitary says: ${text}`;
