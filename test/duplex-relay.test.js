@@ -365,3 +365,54 @@ test("R17: an older offer's delivery finishing after a newer list does not downg
   await r.relay.idle();
   assert.equal(r.sent.length, before, "an accepted answer to the newest offer is not echoed");
 });
+
+// A running say holds the ordered work queue; card deliveries do not use it.
+function blockQueue(r, label) {
+  const running = claim(r.dir, `req-${label}`, `p-${label}`, { subject: { kind: "say", textFp: textPrint(label) }, holdMs: 60000 });
+  r.relay.onEvent({ type: "user_turn", text: label });
+  return () => finish(running.path, { ok: true }, { outcome: "accepted", replyFp: textPrint("x") });
+}
+
+test("R17: while a running reply holds the ordered queue, a newer successful delivery still remembers the newest offer (single card)", async () => {
+  const r = rig();
+  await r.relay.onUp(r.reads);
+  await r.relay.onCards([live()]);
+  const release = blockQueue(r, "hold-one");
+  await wait(30);
+  await r.relay.onCards([live(card("1", { offerId: "1-v2", lifecycleId: "1-l2" }))]);
+  assert.equal(r.relay.meta["1"].offerId, "1-v2");
+  release();
+  await wait(60);
+  await r.relay.idle();
+  assert.equal(r.relay.meta["1"].offerId, "1-v2", "the lagging refresh does not downgrade it either");
+  assert.equal(r.relay.meta["1"].lifecycleId, "1-l2");
+});
+
+test("R17: the same through the summary of cards not sent in full", async () => {
+  const r = rig();
+  await r.relay.onUp(r.reads);
+  await r.relay.onCards([live()]);
+  const release = blockQueue(r, "hold-two");
+  await wait(30);
+  const many = [live(card("1", { offerId: "1-v2", lifecycleId: "1-l2" })), ...["2", "3", "4", "5", "6", "7"].map((id) => live(card(id)))];
+  await r.relay.onCards(many);
+  assert.ok(r.sent.some((m) => /more cards? not sent in full/.test(m)), "card 1 was in the summary");
+  assert.equal(r.relay.meta["1"].offerId, "1-v2");
+  release();
+  await wait(60);
+  await r.relay.idle();
+  assert.equal(r.relay.meta["1"].offerId, "1-v2");
+});
+
+test("R18: cards that vanish before ever being receipted (streaming, or rejected) are not kept", async () => {
+  const r = rig();
+  await r.relay.onUp(r.reads);
+  r.mode = "refuse";
+  await r.relay.onCards([live(card("1", { status: "streaming" })), live(card("2"))]);
+  assert.equal(r.relay.latest.size, 2);
+  r.relay.onDown();
+  await r.relay.onUp(r.reads);
+  await r.relay.onCards([]);
+  assert.equal(r.relay.latest.size, 0);
+  assert.deepEqual(Object.keys(r.relay.sent), []);
+});

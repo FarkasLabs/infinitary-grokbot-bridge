@@ -86,6 +86,12 @@ export class Relay {
     this.meta[card.id] = { id: card.id, title: card.title, lifecycleId: card.lifecycleId, offerId: card.offerId, taskId: card.taskId, actions: card.actions };
   }
 
+  /** Remembers a card as the newest list shows it; a card no list shows any more is not remembered. */
+  #current(id) {
+    const now = this.latest.get(id);
+    if (now) this.#remember(now);
+  }
+
   #save() {
     writePrivate(receiptsPath(this.dir), JSON.stringify({ sent: this.sent, meta: this.meta, noticeSent: this.noticeSent, ended: this.ended.slice(-200) }));
   }
@@ -169,6 +175,10 @@ export class Relay {
   onCards(cards) {
     const s = this.s;
     // What the snapshot says is taken in the moment it arrives, however long earlier messages take to deliver.
+    // The newest list's cards, noted the moment it arrives whatever else is queued; cards it no longer shows are dropped.
+    const shown = new Set(cards.map((c) => c.id));
+    for (const id of this.latest.keys()) if (!shown.has(id)) this.latest.delete(id);
+    for (const c of cards) this.latest.set(c.id, c);
     const prior = this.cardsRun;
     this.#note(s, cards, Date.now(), prior);
     const run = prior.then(() => this.#cards(s, cards));
@@ -210,10 +220,9 @@ export class Relay {
       if (!this.#alive(s)) return;
       for (const c of cards) {
         s.known.set(c.id, c);
-        this.latest.set(c.id, c);
-        if (c.id in this.sent) this.#remember(c); // the current offer and lifecycle, in arrival order; also upgrades a receipt file from before descriptors
+        if (c.id in this.sent) this.#remember(this.latest.get(c.id) ?? c); // the current offer and lifecycle, in arrival order; also upgrades a receipt file from before descriptors
       }
-      for (const id of Object.keys(this.sent)) if (!live.has(id)) (delete this.sent[id], delete this.meta[id], this.latest.delete(id));
+      for (const id of Object.keys(this.sent)) if (!live.has(id)) (delete this.sent[id], delete this.meta[id]);
       this.#save();
       for (const c of cards) {
         const early = s.early.get(c.id);
@@ -228,7 +237,7 @@ export class Relay {
     if (!this.enabled()) return;
     const ready = cards.filter((c) => c.status !== "streaming");
     const live = new Set(cards.map((c) => c.id));
-    if (!s.up) for (const id of Object.keys(this.sent)) if (!live.has(id)) (delete this.sent[id], delete this.meta[id], this.latest.delete(id));
+    if (!s.up) for (const id of Object.keys(this.sent)) if (!live.has(id)) (delete this.sent[id], delete this.meta[id]);
     const due = ready
       .filter((c) => this.sent[c.id] !== versionOf(c))
       .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
@@ -236,12 +245,12 @@ export class Relay {
     const rest = due.slice(0, due.length - shown.length);
     for (const card of shown) {
       const updated = card.id in this.sent;
-      if (await this.#emit(cardMessage(card, { updated }))) (this.sent[card.id] = versionOf(card), this.#remember(this.latest.get(card.id) ?? card));
+      if (await this.#emit(cardMessage(card, { updated }))) (this.sent[card.id] = versionOf(card), this.#current(card.id));
     }
     if (rest.length) {
       const lines = rest.map((c) => `- ${c.title} (card ${c.id})`);
       const ok = await this.#emit(`${rest.length} more card${rest.length === 1 ? "" : "s"} not sent in full:\n${lines.join("\n")}\nAsk for any of them by id.`);
-      if (ok) for (const c of rest) (this.sent[c.id] = versionOf(c), this.#remember(this.latest.get(c.id) ?? c));
+      if (ok) for (const c of rest) (this.sent[c.id] = versionOf(c), this.#current(c.id));
     }
     this.#save();
   }
