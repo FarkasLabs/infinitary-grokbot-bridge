@@ -103,6 +103,13 @@ const threadOf = async (link, id) => {
   }
 };
 
+/**
+ * A reused request id prints its saved result and sends nothing, so a saved refusal must not read as a new one
+ * that waiting could cure. An unclear saved outcome is not called a refusal.
+ */
+const replayNote = (r, id) =>
+  r.replayed ? ` (request ${id} was already ${r.unclear ? "sent and its outcome is unclear" : "refused"}; nothing was sent again)` : "";
+
 export async function main(argv, { out = (s) => process.stdout.write(`${s}\n`), env = process.env, stdin = process.stdin } = {}) {
   const dir = stateDir(env);
   const [cmd, ...rest] = argv;
@@ -176,7 +183,10 @@ export async function main(argv, { out = (s) => process.stdout.write(`${s}\n`), 
           cardId: positionals[0], actionId: positionals[1], offerId: values.offer, lifecycleId: values.lifecycle,
           requestId: values.request, answers, confirm: values.confirm,
         });
-        if (!r.ok) return out(`Infinitary did not take it: ${r.refusal}`);
+        if (!r.ok) {
+          const again = r.replayed && !r.unclear ? " To press again, use a new --request id." : "";
+          return out(`Infinitary did not take it${replayNote(r, values.request)}: ${r.refusal}${again}`);
+        }
         out(`${r.replayed ? "Already done: " : ""}Pressed "${r.label}" on card ${positionals[0]}.`);
       });
     }
@@ -196,7 +206,7 @@ export async function main(argv, { out = (s) => process.stdout.write(`${s}\n`), 
       const { values, positionals } = parseArgs({ args: rest, options: FLAGS, allowPositionals: true });
       return withActHome(dir, async (link) => {
         const r = await ackNote(link, dir, { cardId: positionals[0], offerId: values.offer, lifecycleId: values.lifecycle, requestId: values.request });
-        if (!r.ok) return out(`Not acknowledged: ${r.refusal}`);
+        if (!r.ok) return out(`Not acknowledged${replayNote(r, values.request)}: ${r.refusal}`);
         out(`${r.replayed ? "Already done: " : ""}Acknowledged note ${positionals[0]}; Infinitary closed it.`);
       });
     }
