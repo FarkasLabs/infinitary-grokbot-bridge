@@ -171,9 +171,11 @@ As its maintainer describes it, importing it gives you:
 
 - a relay bot with the relay rules;
 - an **"Infinitary updates"** routine that runs when a webhook fires (each message the bridge sends runs it once);
-- a first-run setup that asks for the computer, the bridge checkout path and the projects, then walks you through putting the routine's webhook URL, key and header into the bridge's settings and sending a test ping.
+- a first-run setup that asks for the computer, the bridge checkout path and the projects, then walks you through the routine's webhook URL, key and header for the bridge's webhook setup and sending a test ping.
 
-The template was exported cleaned of private data: your computer, paths and webhook values are yours to enter during the first run. This project's own checks have not imported it; the description above is the maintainer's.
+Of those three routine values, the bridge's settings take two: the Webhook URL and the bare Webhook key. The bridge builds the header itself from the key, so the header goes nowhere (see [step 3](#3-connect-the-routine-to-the-bridge)).
+
+The maintainer says the template was exported cleaned of private data, so your computer, paths and webhook values are yours to enter during the first run. This project's own checks have not imported it: the description above is the maintainer's, and the rest of this section is what the bridge itself needs.
 
 ### 2. Answer the first-run setup
 
@@ -181,11 +183,11 @@ The template was exported cleaned of private data: your computer, paths and webh
 | --- | --- |
 | The computer | The computer where Infinitary and the bridge run. The bot runs the bridge's commands there, so allow Grok Bot to run tasks on this computer, not only on its own computer. |
 | The bridge checkout path | The folder `git clone` made in [Install](#install), for example `~/infinitary-grokbot-bridge`. The bot runs `grokbot-bridge <command>`, or `node <checkout>/bin/grokbot-bridge.js <command>` if you skipped `npm link`. |
-| The projects | The Infinitary projects you want the bot to relay and work on. |
+| The projects | The Infinitary projects you want the bot to talk about with you. This guides the bot only. The bridge relays every card Infinitary shows, from every project, and the pairing gives it full access to your Infinitary, so naming projects here neither hides other projects' cards from the bot nor limits which cards the bridge's commands can act on. |
 
 ### 3. Connect the routine to the bridge
 
-The "Infinitary updates" routine's details in Grok Bot show three fields. They are your secrets: enter them yourself, only in the bridge's settings file (see [Settings](#settings), mode 600). Never put them in the bot's instructions, a chat, an issue or git.
+The "Infinitary updates" routine's details in Grok Bot show three fields, and all three are secrets. Only two go into the bridge's settings file (see [Settings](#settings), mode 600): the Webhook URL and the bare Webhook key. The Authorization header is the line the bridge builds from the key, so it goes nowhere. Keep all three out of the bot's instructions, issues and git.
 
 | Grok Bot shows | Where it goes | Note |
 | --- | --- | --- |
