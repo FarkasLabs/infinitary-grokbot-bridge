@@ -212,3 +212,32 @@ test("cards prints each task's key with read and put-aside marks, and status fol
     await home.close();
   }
 });
+
+// Intent (GRBP-31): reading or listing a note never closes it or marks it read; the bridge only reads.
+test("listing cards and processing pushes leave a note open and its read state alone", async () => {
+  const note = card("2", { actions: [], taskId: "t2", seen: false });
+  const home = await startHome({ cards: [note] });
+  home.state.tasks = { t2: { id: "t2", key: "GRBP-29" } };
+  const dir = tmp();
+  const env = { ...process.env, GROKBOT_BRIDGE_HOME: dir };
+  const lines = [];
+  let daemon;
+  try {
+    await pair(home.link(), dir);
+    setEnabled(dir, true);
+    daemon = await runDaemon(dir, { send: async () => ({ ok: true, status: 200 }), pollMs: 20, log: () => {} });
+    await until(() => readJson(join(dir, "status.json"), {}).cards === 1);
+    await main(["cards"], { env, out: (s) => lines.push(s) });
+    await main(["show", "2"], { env, out: (s) => lines.push(s) });
+    home.push([card("2", { actions: [], taskId: "t2", seen: false, offerId: "2-v2" }), card("3")]);
+    await until(() => readJson(join(dir, "status.json"), {}).cards === 2);
+    assert.match(lines[0], /^2\tGRBP-29\tNote \(no answer needed\)\tCard 2$/, "unread note: no read mark added by listing");
+    assert.deepEqual(home.state.changes, [], "no change request left the bridge");
+    const allowed = new Set(["inf:cards:list", "inf:cards:thread", "inf:cards:past", "inf:tasks:detail", "inf:cards:picture"]);
+    assert.deepEqual(home.state.invoked.filter((c) => !allowed.has(c)), [], "only read channels were used: no seen, act, close or dismiss");
+    assert.equal(home.state.cards.find((c) => c.id === "2")?.seen, false, "the note is still open and unread at the home");
+  } finally {
+    daemon?.stop();
+    await home.close();
+  }
+});
