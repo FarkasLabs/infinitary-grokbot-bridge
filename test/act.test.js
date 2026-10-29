@@ -398,3 +398,71 @@ test("closing is never a read: the relay's read link cannot close a card, and th
     await home.close();
   }
 });
+
+// Intent: GRBP-36, the captain's choice "Finish GRBP-22 and fix the repeat wording" (GRBP-37). A reused request id
+// prints its saved result without asking Infinitary anything, so a saved refusal must say it is the old one and that
+// nothing was sent again, instead of reading as a fresh refusal that waiting could cure. The leads stay; the id still
+// never acts twice; an unclear saved outcome is never called a refusal or met with advice to press again.
+const NOT_READY = "This choice is not ready. Wait for the card to return.";
+const recordOf = (dir, id) => readFileSync(join(dir, "requests", `${id}.json`), "utf8");
+
+test("a reused answer request id says its refusal was already given and sends nothing, where a fresh one reads as before", async () => {
+  const { home, run, lines, dir } = await setup([plain], { refuseAct: NOT_READY });
+  try {
+    const args = ["answer", "6", "go", ...ids(plain), "--request", "req-notready1"];
+    await run(args);
+    assert.equal(lines.at(-1), `Infinitary did not take it: ${NOT_READY}`);
+    const saved = recordOf(dir, "req-notready1");
+    home.state.refuseAct = undefined; // the card is answerable now, which a repeat cannot learn
+    const invoked = home.state.invoked.length;
+    await run(args);
+    assert.equal(lines.at(-1), `Infinitary did not take it (request req-notready1 was already refused; nothing was sent again): ${NOT_READY} To press again, use a new --request id.`);
+    assert.equal(home.state.invoked.length, invoked, "the repeat asked Infinitary nothing");
+    assert.equal(home.state.changes.length, 1);
+    assert.equal(recordOf(dir, "req-notready1"), saved, "the saved refusal stays as it was");
+    await run(["answer", "6", "go", ...ids(plain), "--request", "req-notready2"]);
+    assert.equal(lines.at(-1), 'Pressed "Go ahead" on card 6.');
+    assert.equal(home.state.changes.length, 2);
+  } finally {
+    await home.close();
+  }
+});
+
+test("a reused ack request id says the note was already not acknowledged and sends nothing, with no advice to change the id", async () => {
+  const { home, run, lines, dir } = await setup([note], { keepOnClose: true });
+  try {
+    const args = ["ack", "21", ...ids(note), "--request", "ack-21-v1aa"];
+    await run(args);
+    assert.equal(lines.at(-1), "Not acknowledged: Infinitary still shows the note.");
+    const saved = recordOf(dir, "ack-21-v1aa");
+    const invoked = home.state.invoked.length;
+    await run(args);
+    assert.equal(lines.at(-1), "Not acknowledged (request ack-21-v1aa was already refused; nothing was sent again): Infinitary still shows the note.");
+    assert.equal(home.state.invoked.length, invoked, "the repeat asked Infinitary nothing");
+    assert.equal(home.state.changes.length, 1);
+    assert.equal(recordOf(dir, "ack-21-v1aa"), saved);
+  } finally {
+    await home.close();
+  }
+});
+
+test("a reused answer request id whose press could not be confirmed says so, is not called refused, and is not told to press again", async () => {
+  const { home, run, lines, dir } = await setup([plain]);
+  // The card leaves the list but Infinitary gives no ending for it, so the bridge cannot tell whether the press counted.
+  home.state.endCard = (cardId) => { home.state.cards = home.state.cards.filter((c) => c.id !== cardId); };
+  try {
+    const args = ["answer", "6", "go", ...ids(plain), "--request", "req-unclear1"];
+    await run(args);
+    const unclear = lines.at(-1);
+    assert.match(unclear, /^Infinitary did not take it: Infinitary did not confirm how the card ended\./);
+    assert.equal(JSON.parse(recordOf(dir, "req-unclear1")).outcome, "unknown");
+    const invoked = home.state.invoked.length;
+    await run(args);
+    assert.equal(lines.at(-1), unclear.replace(/^Infinitary did not take it/, "Infinitary did not take it (request req-unclear1 was already sent and its outcome is unclear; nothing was sent again)"));
+    assert.doesNotMatch(lines.at(-1), /refused|new --request/);
+    assert.equal(home.state.invoked.length, invoked, "the repeat asked Infinitary nothing");
+    assert.equal(home.state.changes.length, 1);
+  } finally {
+    await home.close();
+  }
+});
