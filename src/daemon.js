@@ -39,6 +39,8 @@ export async function runDaemon(dir, { send, openLink = (g) => new HomeLink(g), 
   let stopped = false;
   const setStatus = (extra) => writePrivate(statusPath(dir), JSON.stringify({ at: Date.now(), enabled: isEnabled(dir), ...extra }));
 
+  let homeName = null;
+
   async function connect() {
     connecting = true;
     try {
@@ -46,9 +48,13 @@ export async function runDaemon(dir, { send, openLink = (g) => new HomeLink(g), 
       if (!grant) throw new Error("not paired");
       const l = openLink(grant);
       const welcome = await l.open();
+      homeName = welcome.name ?? null;
       l.on("push", (channel, payload) => {
         if (link !== l) return;
-        if (channel === "inf:cards" && Array.isArray(payload)) relay.onCards(payload).catch((e) => log(e.message));
+        if (channel === "inf:cards" && Array.isArray(payload)) {
+          setStatus({ connected: true, home: homeName, cards: payload.length });
+          relay.onCards(payload).catch((e) => log(e.message));
+        }
         else if (channel === "inf:cards:thread") relay.onThread(payload);
         else if (channel === "inf:event") relay.onEvent(payload);
       });
@@ -67,7 +73,7 @@ export async function runDaemon(dir, { send, openLink = (g) => new HomeLink(g), 
         task: (id) => l.invoke("inf:tasks:detail", [id]),
       });
       const cards = await l.invoke("inf:cards:list", []);
-      setStatus({ connected: true, home: welcome.name ?? null, cards: cards.length });
+      setStatus({ connected: true, home: homeName, cards: cards.length });
       const shown = relay.onCards(cards);
       await up;
       await shown;

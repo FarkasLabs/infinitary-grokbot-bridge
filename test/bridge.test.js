@@ -178,3 +178,37 @@ test("the relay daemon relays a note, and when the note disappears it changes no
     await home.close();
   }
 });
+
+// Intent (GRBP-31): `cards` names each card's task and marks read / put-aside cards, and `status` counts the cards showing now.
+test("cards prints each task's key with read and put-aside marks, and status follows every pushed list", async () => {
+  const home = await startHome({ cards: [
+    card("1", { taskId: "t1", seen: true, minimized: true }),
+    card("2", { actions: [], taskId: "t2", seen: true }),
+    card("3", { actions: [], taskId: "gone" }),
+    card("4"),
+  ] });
+  home.state.tasks = { t1: { id: "t1", key: "TIA-40" }, t2: { id: "t2", key: "GRBP-29" } };
+  const dir = tmp();
+  const env = { ...process.env, GROKBOT_BRIDGE_HOME: dir };
+  const lines = [];
+  let daemon;
+  try {
+    await pair(home.link(), dir);
+    setEnabled(dir, true);
+    daemon = await runDaemon(dir, { send: async () => ({ ok: true, status: 200 }), pollMs: 20, log: () => {} });
+    const cardsCount = () => readJson(join(dir, "status.json"), {}).cards;
+    await until(() => cardsCount() === 4);
+    await main(["cards"], { env, out: (s) => lines.push(s) });
+    assert.deepEqual(lines, [
+      "1\tTIA-40\tDecision (read, put aside)\tCard 1",
+      "2\tGRBP-29\tNote (no answer needed, read)\tCard 2",
+      "3\tNote (no answer needed)\tCard 3",
+      "4\tDecision\tCard 4",
+    ], "an unreadable task or a card with no task keeps the plain line");
+    home.push([card("4")]);
+    await until(() => cardsCount() === 1);
+  } finally {
+    daemon?.stop();
+    await home.close();
+  }
+});
