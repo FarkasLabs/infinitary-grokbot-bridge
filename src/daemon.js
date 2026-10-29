@@ -46,10 +46,15 @@ export async function runDaemon(dir, { send, openLink = (g) => new HomeLink(g), 
       if (!grant) throw new Error("not paired");
       const l = openLink(grant);
       const welcome = await l.open();
+      const home = welcome.name ?? null;
+      let pushed = false; // every change is pushed, so a pushed list is never older than the one read at connect
       l.on("push", (channel, payload) => {
         if (link !== l) return;
-        if (channel === "inf:cards" && Array.isArray(payload)) relay.onCards(payload).catch((e) => log(e.message));
-        else if (channel === "inf:cards:thread") relay.onThread(payload);
+        if (channel === "inf:cards" && Array.isArray(payload)) {
+          pushed = true;
+          setStatus({ connected: true, home, cards: payload.length });
+          relay.onCards(payload).catch((e) => log(e.message));
+        } else if (channel === "inf:cards:thread") relay.onThread(payload);
         else if (channel === "inf:event") relay.onEvent(payload);
       });
       l.once("close", () => {
@@ -67,7 +72,7 @@ export async function runDaemon(dir, { send, openLink = (g) => new HomeLink(g), 
         task: (id) => l.invoke("inf:tasks:detail", [id]),
       });
       const cards = await l.invoke("inf:cards:list", []);
-      setStatus({ connected: true, home: welcome.name ?? null, cards: cards.length });
+      if (!pushed) setStatus({ connected: true, home, cards: cards.length });
       const shown = relay.onCards(cards);
       await up;
       await shown;

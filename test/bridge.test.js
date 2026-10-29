@@ -178,3 +178,86 @@ test("the relay daemon relays a note, and when the note disappears it changes no
     await home.close();
   }
 });
+
+// Intent (GRBP-31): `cards` names each card's task and marks read / put-aside cards, and `status` counts the cards showing now.
+test("cards prints each task's key with read and put-aside marks, and status follows every pushed list", async () => {
+  const home = await startHome({ cards: [
+    card("1", { taskId: "t1", seen: true, minimized: true }),
+    card("2", { actions: [], taskId: "t2", seen: true }),
+    card("3", { actions: [], taskId: "gone" }),
+    card("4"),
+  ] });
+  home.state.tasks = { t1: { id: "t1", key: "TIA-40" }, t2: { id: "t2", key: "GRBP-29" } };
+  const dir = tmp();
+  const env = { ...process.env, GROKBOT_BRIDGE_HOME: dir };
+  const lines = [];
+  let daemon;
+  try {
+    await pair(home.link(), dir);
+    setEnabled(dir, true);
+    daemon = await runDaemon(dir, { send: async () => ({ ok: true, status: 200 }), pollMs: 20, log: () => {} });
+    const cardsCount = () => readJson(join(dir, "status.json"), {}).cards;
+    await until(() => cardsCount() === 4);
+    await main(["cards"], { env, out: (s) => lines.push(s) });
+    assert.deepEqual(lines, [
+      "1\tTIA-40\tDecision (read, put aside)\tCard 1",
+      "2\tGRBP-29\tNote (no answer needed, read)\tCard 2",
+      "3\tNote (no answer needed)\tCard 3",
+      "4\tDecision\tCard 4",
+    ], "an unreadable task or a card with no task keeps the plain line");
+    home.push([card("4")]);
+    await until(() => cardsCount() === 1);
+  } finally {
+    daemon?.stop();
+    await home.close();
+  }
+});
+
+// Intent (GRBP-31): status follows every list Infinitary sends, so a list read at connect that answers after a newer push does not win.
+test("a connect-time card list answered after a newer push does not overwrite the status count", async () => {
+  const home = await startHome({ cards: [card("1"), card("2"), card("3")] });
+  home.state.delayReply = { channel: "inf:cards:list", occurrence: 1, ms: 200 };
+  const dir = tmp();
+  let daemon;
+  try {
+    await pair(home.link(), dir);
+    setEnabled(dir, true);
+    daemon = await runDaemon(dir, { send: async () => ({ ok: true, status: 200 }), pollMs: 20, log: () => {} });
+    const lists = [];
+    const onCards = daemon.relay.onCards.bind(daemon.relay);
+    daemon.relay.onCards = (cards) => (lists.push(cards.length), onCards(cards));
+    await until(() => home.state.invoked.includes("inf:cards:list"));
+    home.push([card("1")]);
+    await until(() => lists.length === 2);
+    assert.deepEqual(lists, [1, 3], "the push arrived first and the older connect-time list after it");
+    assert.equal(readJson(join(dir, "status.json"), {}).cards, 1);
+  } finally {
+    daemon?.stop();
+    await home.close();
+  }
+});
+
+// Intent (GRBP-31): reading a note must not close it or mark it read, so listing, showing and pushed lists only read.
+test("cards, show and pushed lists send no change or read request to the home", async () => {
+  const home = await startHome({ cards: [card("2", { actions: [], taskId: "t2", seen: false })] });
+  home.state.tasks = { t2: { id: "t2", key: "GRBP-29" } };
+  const dir = tmp();
+  const env = { ...process.env, GROKBOT_BRIDGE_HOME: dir };
+  let daemon;
+  try {
+    await pair(home.link(), dir);
+    setEnabled(dir, true);
+    daemon = await runDaemon(dir, { send: async () => ({ ok: true, status: 200 }), pollMs: 20, log: () => {} });
+    await until(() => readJson(join(dir, "status.json"), {}).cards === 1);
+    await main(["cards"], { env, out: () => {} });
+    await main(["show", "2"], { env, out: () => {} });
+    home.push([card("2", { actions: [], taskId: "t2", seen: false, offerId: "2-v2" }), card("3")]);
+    await until(() => readJson(join(dir, "status.json"), {}).cards === 2);
+    assert.deepEqual(home.state.changes, [], "no press, reply or close left the bridge");
+    const allowed = new Set(["inf:cards:list", "inf:cards:thread", "inf:cards:past", "inf:tasks:detail", "inf:cards:picture"]);
+    assert.deepEqual(home.state.invoked.filter((c) => !allowed.has(c)), [], "no seen, act, close or dismiss request was made");
+  } finally {
+    daemon?.stop();
+    await home.close();
+  }
+});

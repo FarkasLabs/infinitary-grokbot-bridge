@@ -105,8 +105,8 @@ Each command takes at most one card id (checked against `^[A-Za-z0-9_.:-]{1,128}
 
 | Command | Does | Acts on Infinitary? |
 | --- | --- | --- |
-| `on` / `off` / `status` | The switch, and its state. | No |
-| `cards` | Id, kind and title of each card showing now. | No |
+| `on` / `off` / `status` | The switch, and its state. `cards` in the state is the number of cards showing at the latest list Infinitary sent. | No |
+| `cards` | Id, task key, kind and title of each card showing now, marked `read` once you have seen it in Infinitary and `put aside` if you minimized it. A task whose key cannot be read shows no key. | No |
 | `show <id>` | One card whole as text, buttons and questions spelled out, with its `offer`, `lifecycle` and thread. | No |
 | `page <id> [--out file]` | One card as a self-contained HTML page, to stdout or a file. | No |
 | `last` | The first mate's latest answer. | No |

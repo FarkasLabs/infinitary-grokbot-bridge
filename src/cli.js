@@ -14,7 +14,7 @@ const run = promisify(execFile);
 const ID = /^[A-Za-z0-9_.:-]{1,128}$/;
 const USAGE = `grokbot-bridge <command>
   on | off | status       the switch (persistent); off holds no connection and sends nothing
-  cards                   list the cards Infinitary shows now
+  cards                   list the cards Infinitary shows now, with each task's key and read / put-aside marks
   show <card-id>          one card whole, as text, with its thread
   page <card-id> [--out file]   one card as a self-contained page in Infinitary's look
   answer <card-id> <button-id> --offer O --lifecycle L --request R [--confirm]
@@ -75,6 +75,19 @@ async function withHome(dir, fn) {
   }
 }
 
+/** Each card's task key, read once per task; a task that cannot be read simply has no key shown. */
+async function taskKeys(link, cards) {
+  const ids = [...new Set(cards.map((c) => c.taskId).filter((id) => typeof id === "string" && ID.test(id)))];
+  const keys = new Map();
+  await Promise.all(ids.map(async (id) => {
+    try {
+      const key = (await link.invoke("inf:tasks:detail", [id]))?.key;
+      if (typeof key === "string" && key) keys.set(id, key);
+    } catch {}
+  }));
+  return keys;
+}
+
 async function cardById(link, id) {
   if (!ID.test(id ?? "")) throw new Error("Give a card id, as 'cards' lists them.");
   const card = (await link.invoke("inf:cards:list", [])).find((c) => c.id === id);
@@ -116,7 +129,12 @@ export async function main(argv, { out = (s) => process.stdout.write(`${s}\n`), 
       return withHome(dir, async (link) => {
         const cards = await link.invoke("inf:cards:list", []);
         if (!cards.length) return out("No cards are showing.");
-        for (const c of cards) out(`${c.id}\t${kindOf(c)}${c.actions?.length ? "" : " (no answer needed)"}\t${c.title}`);
+        const keys = await taskKeys(link, cards);
+        for (const c of cards) {
+          const marks = [c.actions?.length ? "" : "no answer needed", c.seen ? "read" : "", c.minimized ? "put aside" : ""].filter(Boolean);
+          const key = keys.get(c.taskId);
+          out(`${c.id}${key ? `\t${key}` : ""}\t${kindOf(c)}${marks.length ? ` (${marks.join(", ")})` : ""}\t${c.title}`);
+        }
       });
     case "show":
       return withHome(dir, async (link) => {
