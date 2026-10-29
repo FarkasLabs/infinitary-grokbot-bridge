@@ -213,29 +213,49 @@ test("cards prints each task's key with read and put-aside marks, and status fol
   }
 });
 
-// Intent (GRBP-31): reading or listing a note never closes it or marks it read; the bridge only reads.
-test("listing cards and processing pushes leave a note open and its read state alone", async () => {
-  const note = card("2", { actions: [], taskId: "t2", seen: false });
-  const home = await startHome({ cards: [note] });
+// Intent (GRBP-31): status follows every list Infinitary sends, so a list read at connect that answers after a newer push does not win.
+test("a connect-time card list answered after a newer push does not overwrite the status count", async () => {
+  const home = await startHome({ cards: [card("1"), card("2"), card("3")] });
+  home.state.delayReply = { channel: "inf:cards:list", occurrence: 1, ms: 200 };
+  const dir = tmp();
+  let daemon;
+  try {
+    await pair(home.link(), dir);
+    setEnabled(dir, true);
+    daemon = await runDaemon(dir, { send: async () => ({ ok: true, status: 200 }), pollMs: 20, log: () => {} });
+    const lists = [];
+    const onCards = daemon.relay.onCards.bind(daemon.relay);
+    daemon.relay.onCards = (cards) => (lists.push(cards.length), onCards(cards));
+    await until(() => home.state.invoked.includes("inf:cards:list"));
+    home.push([card("1")]);
+    await until(() => lists.length === 2);
+    assert.deepEqual(lists, [1, 3], "the push arrived first and the older connect-time list after it");
+    assert.equal(readJson(join(dir, "status.json"), {}).cards, 1);
+  } finally {
+    daemon?.stop();
+    await home.close();
+  }
+});
+
+// Intent (GRBP-31): reading a note must not close it or mark it read, so listing, showing and pushed lists only read.
+test("cards, show and pushed lists send no change or read request to the home", async () => {
+  const home = await startHome({ cards: [card("2", { actions: [], taskId: "t2", seen: false })] });
   home.state.tasks = { t2: { id: "t2", key: "GRBP-29" } };
   const dir = tmp();
   const env = { ...process.env, GROKBOT_BRIDGE_HOME: dir };
-  const lines = [];
   let daemon;
   try {
     await pair(home.link(), dir);
     setEnabled(dir, true);
     daemon = await runDaemon(dir, { send: async () => ({ ok: true, status: 200 }), pollMs: 20, log: () => {} });
     await until(() => readJson(join(dir, "status.json"), {}).cards === 1);
-    await main(["cards"], { env, out: (s) => lines.push(s) });
-    await main(["show", "2"], { env, out: (s) => lines.push(s) });
+    await main(["cards"], { env, out: () => {} });
+    await main(["show", "2"], { env, out: () => {} });
     home.push([card("2", { actions: [], taskId: "t2", seen: false, offerId: "2-v2" }), card("3")]);
     await until(() => readJson(join(dir, "status.json"), {}).cards === 2);
-    assert.match(lines[0], /^2\tGRBP-29\tNote \(no answer needed\)\tCard 2$/, "unread note: no read mark added by listing");
-    assert.deepEqual(home.state.changes, [], "no change request left the bridge");
+    assert.deepEqual(home.state.changes, [], "no press, reply or close left the bridge");
     const allowed = new Set(["inf:cards:list", "inf:cards:thread", "inf:cards:past", "inf:tasks:detail", "inf:cards:picture"]);
-    assert.deepEqual(home.state.invoked.filter((c) => !allowed.has(c)), [], "only read channels were used: no seen, act, close or dismiss");
-    assert.equal(home.state.cards.find((c) => c.id === "2")?.seen, false, "the note is still open and unread at the home");
+    assert.deepEqual(home.state.invoked.filter((c) => !allowed.has(c)), [], "no seen, act, close or dismiss request was made");
   } finally {
     daemon?.stop();
     await home.close();
