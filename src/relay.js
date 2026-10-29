@@ -3,7 +3,7 @@ import { readJson, receiptsPath, writePrivate } from "./state.js";
 import { effectOf } from "./act.js";
 import { commentNotice, endingNotice, endingWhat, mergeRefusedNotice, mergeResultNotice, replyNotice, threadAnswerNotice, turnNotice, unclearNotice } from "./notices.js";
 import { answersPrint, claimMarker, hasMarker, readRequests, textPrint } from "./requests.js";
-import { cardMessage, chunk } from "./text.js";
+import { cardMessage, chunk, onStage } from "./text.js";
 
 export const CATCH_UP_MAX = 5;
 export const OFFLINE_AFTER_MS = 10 * 60 * 1000;
@@ -240,7 +240,7 @@ export class Relay {
 
   async #cards(s, cards) {
     if (!this.enabled()) return;
-    const ready = cards.filter((c) => c.status !== "streaming");
+    const ready = cards.filter((c) => c.status !== "streaming" && onStage(c));
     const live = new Set(cards.map((c) => c.id));
     if (!s.up) for (const id of Object.keys(this.sent)) if (!live.has(id)) delete this.sent[id];
     const due = ready

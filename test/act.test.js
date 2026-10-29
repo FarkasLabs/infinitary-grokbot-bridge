@@ -65,6 +65,25 @@ test("a stale offer, a reopened card, a missing id and an unready card are refus
   }
 });
 
+// Intent: GRBP-17. Infinitary refuses a choice on a card off its stage ("This choice is not ready.
+// Wait for the card to return."); the bridge says so in its own words before any press, and the
+// request id stays usable for the same press once the card is on the stage.
+test("an answer on a card still with its author is refused before anything is sent, and works once it is on the stage", async () => {
+  const held = card("10", { awaiting: "close-out" });
+  const { home, run, lines } = await setup([held]);
+  try {
+    const args = ["answer", "10", "go", ...ids(held), "--request", "req-held-0001"];
+    await assert.rejects(run(args), /still with its author \(close-out\)/);
+    assert.equal(home.state.changes.length, 0, "Infinitary was never asked");
+    home.state.cards = [card("10", { awaiting: "close-out", sentBackAt: 9 })];
+    await run(args);
+    assert.match(lines.at(-1), /Pressed "Go" on card 10/);
+    assert.equal(home.state.changes.length, 1);
+  } finally {
+    await home.close();
+  }
+});
+
 test("a replayed request id does nothing twice; a reused id for other content, and an unknown outcome, are refused", async () => {
   const { home, run, lines, dir } = await setup([plain]);
   try {
