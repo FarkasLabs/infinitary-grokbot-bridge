@@ -22,10 +22,26 @@ export const pinOf = (certPem) =>
 
 export async function startHome({ cards = [] } = {}) {
   const keys = makeKeys();
-  const state = { cards, code: "c".repeat(43), paired: new Set(), hellos: [], invoked: [], changes: [], sockets: new Set(), origins: [], delayedReplyCount: 0 };
+  const state = { cards, code: "c".repeat(43), paired: new Set(), hellos: [], invoked: [], changes: [], sockets: new Set(), origins: [], past: {}, delayedReplyCount: 0 };
   state.pushEvent = (event) => {
     for (const ws of state.sockets) ws.send(JSON.stringify({ t: "push", channel: "inf:event", payload: event }));
   };
+  const broadcast = (channel, payload) => { for (const ws of state.sockets) ws.send(JSON.stringify({ t: "push", seq: 1, channel, payload })); };
+  /** What Infinitary does when a card ends: the card leaves the list, its ending is kept, every view hears. */
+  state.endCard = (cardId, ending, answers = []) => {
+    const c = state.cards.find((x) => x.id === cardId);
+    if (!c) return;
+    const label = c.actions?.find((a) => a.id === ending.actionId)?.label;
+    state.past[cardId] = { id: cardId, title: c.title, actions: c.actions, ending: { at: Date.now(), ...(label ? { label } : {}), ...ending }, answers: answers.map((a) => ({ ...a, labels: a.labels ?? a.values })), messages: [] };
+    state.cards = state.cards.filter((x) => x.id !== cardId);
+    broadcast("inf:cards", state.cards);
+  };
+  state.addLine = (cardId, who, text) => {
+    const thread = (state.threads ??= {})[cardId] ??= [];
+    thread.push({ id: thread.length + 1, who, text, cardId, at: Date.now() });
+    broadcast("inf:cards:thread", { cardId, messages: thread });
+  };
+  state.broadcast = broadcast;
   const server = https.createServer({ ...keys, requestCert: true, rejectUnauthorized: false, minVersion: "TLSv1.3" }, (req, res) => {
     if (req.url !== "/pair" || req.method !== "POST") return res.writeHead(404).end();
     let body = "";
@@ -51,7 +67,7 @@ export async function startHome({ cards = [] } = {}) {
     if (req.headers.origin) return socket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
     if (req.url !== "/connection") return socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
     if (!known) return socket.end("HTTP/1.1 401 Unauthorized\r\n\r\n");
-    wss.handleUpgrade(req, socket, head, (ws) => {
+    const admit = () => wss.handleUpgrade(req, socket, head, (ws) => {
       state.sockets.add(ws);
       ws.on("close", () => state.sockets.delete(ws));
       let access = "full";
@@ -74,6 +90,8 @@ export async function startHome({ cards = [] } = {}) {
           };
           if (f.channel === "inf:cards:list") reply(state.cards);
           else if (f.channel === "inf:cards:thread") reply({ cardId: f.args[0], messages: state.threads?.[f.args[0]] ?? [] });
+          else if (f.channel === "inf:tasks:detail") reply(state.tasks?.[f.args[0]] ?? null);
+          else if (f.channel === "inf:cards:past") reply(state.past?.[f.args[0]] ?? null);
           else if (f.channel === "inf:cards:picture") reply({ contentType: "image/png", data: "iVBORw0KGgo=" });
           else if (f.channel === "inf:conversation:last-turn") reply(state.lastTurn ?? null);
           else if (f.channel === "inf:conversation:state") reply({ busy: Boolean(state.busy) });
@@ -82,19 +100,27 @@ export async function startHome({ cards = [] } = {}) {
             state.changes.push({ channel: f.channel, args: f.args });
             const [cardId, actionId] = f.args;
             const c = state.cards.find((x) => x.id === cardId);
-            const refusal = state.refuseAct ?? (c && c.actions?.some((a) => a.id === actionId) ? undefined : "undeclared");
+            // Like Infinitary: a press on a card no longer shown answers {} (crewSupervisor.ts), and every action closes its card.
+            const refusal = state.refuseAct ?? (c && !c.actions?.some((a) => a.id === actionId) ? "undeclared" : undefined);
+            if (state.beatBy && c) {
+              // The captain pressed another button a moment earlier: the card is already gone and the press is ignored silently.
+              state.endCard(cardId, { how: "chose", actionId: state.beatBy, by: "captain" });
+              state.beatBy = null;
+            } else if (!refusal && c && !state.keepOnAct) state.endCard(cardId, { how: "chose", actionId, by: "captain" }, f.args[3]?.answers);
+            if (state.cutOnAct) return ws.terminate();
             reply(refusal ? { refusal } : {});
           } else if (f.channel === "inf:cards:close") {
             state.changes.push({ channel: f.channel, args: f.args });
-            if (!state.keepOnClose) state.cards = state.cards.filter((c) => c.id !== f.args[0]);
+            if (!state.keepOnClose) state.endCard(f.args[0], { how: "dismissed" });
             reply({ ok: true });
           } else if (f.channel === "inf:cards:reply") {
             state.changes.push({ channel: f.channel, args: f.args });
             const thread = (state.threads ??= {})[f.args[0]] ??= [];
-            thread.push({ id: thread.length + 1, who: "captain", text: f.args[1].text, cardId: f.args[0], at: Date.now() });
-            if (state.answerReplyInInitialResponse) thread.push({ id: thread.length + 1, who: "crewmate", text: state.answerReplyInInitialResponse, cardId: f.args[0], at: Date.now() });
+            state.addLine(f.args[0], "captain", f.args[1].text);
+            if (state.answerReplyInInitialResponse) state.addLine(f.args[0], "crewmate", state.answerReplyInInitialResponse);
+            if (state.cutOnReply) return ws.terminate();
             reply({ cardId: f.args[0], messages: thread });
-            if (state.answerReply) setTimeout(() => thread.push({ id: thread.length + 1, who: "crewmate", text: state.answerReply, cardId: f.args[0], at: Date.now() }), 60);
+            if (state.answerReply) setTimeout(() => state.addLine(f.args[0], "crewmate", state.answerReply), 60);
           } else if (f.channel === "inf:converse") {
             state.changes.push({ channel: f.channel, args: f.args });
             state.busy = true;
@@ -112,6 +138,7 @@ export async function startHome({ cards = [] } = {}) {
         }
       });
     });
+    if (state.hold) state.hold.push(admit); else admit();
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   const port = server.address().port;
@@ -120,6 +147,8 @@ export async function startHome({ cards = [] } = {}) {
     state, port, pin,
     link: (code = state.code) => `infinitary://join?as=mac&at=192.0.2.10:${port}&key=${pin}&code=${code}`,
     push: (cards) => { state.cards = cards; for (const ws of state.sockets) ws.send(JSON.stringify({ t: "push", seq: 1, channel: "inf:cards", payload: cards })); },
+    hold: () => { state.hold = []; },
+    release: () => { const h = state.hold ?? []; state.hold = null; for (const f of h) f(); },
     kick: () => { for (const ws of state.sockets) ws.terminate(); },
     close: () => new Promise((r) => { for (const ws of state.sockets) ws.terminate(); server.closeAllConnections?.(); server.close(r); }),
   };

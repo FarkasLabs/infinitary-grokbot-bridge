@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -43,3 +43,13 @@ export function setEnabled(dir, on) {
 }
 
 export const hasGrant = (dir) => existsSync(grantPath(dir));
+
+/** Changes with every write of the switch, so a quick off and on between two looks is still seen. */
+export function switchEpoch(dir) {
+  try {
+    const st = statSync(switchPath(dir));
+    return `${st.ino}:${st.mtimeMs}`;
+  } catch {
+    return "none";
+  }
+}

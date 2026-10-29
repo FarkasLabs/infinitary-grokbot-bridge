@@ -12,7 +12,7 @@ export const SPEAK = "999.0.0";
 
 /** The only requests the bridge ever sends. The read side only reads. */
 export const READ_CHANNELS = new Set([
-  "inf:cards:list", "inf:cards:picture", "inf:cards:thread", "inf:conversation:last-turn", "inf:conversation:state",
+  "inf:cards:list", "inf:cards:picture", "inf:cards:thread", "inf:cards:past", "inf:tasks:detail", "inf:conversation:last-turn", "inf:conversation:state",
 ]);
 
 /** Acting: the requests that change something, each only from a command that was asked for. */
